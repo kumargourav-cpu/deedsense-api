@@ -1,23 +1,26 @@
 FROM python:3.12-slim
 
-# System deps for OCR + PDF text extraction
-RUN apt-get update && apt-get install -y \
+# System deps:
+# - tesseract-ocr for OCR
+# - poppler-utils for pdf2image (pdftoppm)
+# - libjpeg/zlib etc for Pillow
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     poppler-utils \
-    libmagic1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps
-COPY requirements.txt .
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
-COPY . .
+COPY . /app
 
-# Render provides PORT, default to 10000
 ENV PORT=10000
+EXPOSE 10000
 
-# Start
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
