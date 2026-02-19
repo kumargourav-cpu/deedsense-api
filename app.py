@@ -1,402 +1,428 @@
 import os
-import io
-import re
 import json
-import shutil
-import tempfile
-from typing import Optional, Dict, Any, List
+import time
+import hmac
+import hashlib
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+import jwt  # PyJWT
+import stripe
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from dotenv import load_dotenv
-
-# --- Text extraction deps ---
-from PIL import Image
-import pytesseract
-
-from pypdf import PdfReader
-from pdf2image import convert_from_bytes
-from docx import Document
-
-# --- OpenAI (stable call path) ---
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None  # Allows app to boot even if openai missing
-
-load_dotenv()
-
-APP_NAME = os.getenv("APP_NAME", "DeedSense API")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))  # hard limit
-MAX_PDF_PAGES_OCR = int(os.getenv("MAX_PDF_PAGES_OCR", "6"))  # scanned pdf OCR pages limit
-MAX_CHARS_TO_MODEL = int(os.getenv("MAX_CHARS_TO_MODEL", "12000"))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # change if you want
+# -----------------------------
+# Config
+# -----------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+DEFAULT_FREE_SCANS = int(os.getenv("DEFAULT_FREE_SCANS", "5"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_PRO_MONTHLY = os.getenv("STRIPE_PRICE_PRO_MONTHLY")
+STRIPE_PRICE_PRO_YEARLY = os.getenv("STRIPE_PRICE_PRO_YEARLY")
 
-# ---- helpers: CORS parsing ----
-def parse_origins(v: str) -> List[str]:
-    v = (v or "").strip()
-    if not v or v == "*":
-        return ["*"]
-    parts = [p.strip() for p in v.split(",") if p.strip()]
-    return parts or ["*"]
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
-
-app = FastAPI(title=APP_NAME, version="1.0.0")
-
-origins = parse_origins(ALLOWED_ORIGINS)
+app = FastAPI(title="DeedSense API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Request models ----
-class AnalyzeTextRequest(BaseModel):
-    text: str
-    source: Optional[str] = "text"
+
+# -----------------------------
+# DB Helpers
+# -----------------------------
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def init_db():
+    # Safe "create if not exists" schema
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            create table if not exists subscriptions (
+              user_id text primary key,
+              plan text not null default 'free',
+              stripe_customer_id text,
+              stripe_subscription_id text,
+              status text default 'active',
+              current_period_end timestamptz
+            );
+
+            create table if not exists usage_monthly (
+              user_id text not null,
+              month text not null,
+              scans_used int not null default 0,
+              primary key (user_id, month)
+            );
+
+            create table if not exists scan_history (
+              id uuid default gen_random_uuid() primary key,
+              user_id text not null,
+              created_at timestamptz not null default now(),
+              input_type text not null,
+              filename text,
+              result_json jsonb not null
+            );
+
+            create table if not exists api_keys (
+              id uuid default gen_random_uuid() primary key,
+              user_id text not null,
+              api_key_hash text not null,
+              label text,
+              active boolean not null default true
+            );
+
+            create index if not exists idx_scan_history_user on scan_history(user_id, created_at desc);
+            """)
+        conn.commit()
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
 
-# ---- Safe limits ----
-def _ensure_size_limit(file: UploadFile):
-    # We can't know exact size without reading; enforce while reading
-    pass
+# -----------------------------
+# Auth Helpers (Supabase JWT)
+# -----------------------------
+def get_user_from_bearer(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not auth_header:
+        return None
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.replace("Bearer ", "").strip()
+    if not SUPABASE_JWT_SECRET:
+        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET not configured")
 
-
-def clamp_text(text: str, max_chars: int = MAX_CHARS_TO_MODEL) -> str:
-    text = (text or "").strip()
-    # Normalize whitespace
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n\n[TRUNCATED]"
-
-
-def clean_for_analysis(text: str) -> str:
-    """Remove extremely sensitive patterns (basic). You can expand this later."""
-    t = text or ""
-    # Mask emails + phone-ish patterns lightly (not perfect)
-    t = re.sub(r"[\w\.-]+@[\w\.-]+\.\w+", "[email_redacted]", t)
-    t = re.sub(r"\+?\d[\d\-\s]{7,}\d", "[phone_redacted]", t)
-    return t
-
-
-# ---- OCR availability checks ----
-def is_tesseract_available() -> bool:
     try:
-        _ = pytesseract.get_tesseract_version()
-        return True
+        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        # Supabase user id is usually in "sub"
+        return {"user_id": payload.get("sub"), "email": payload.get("email"), "role": payload.get("role")}
     except Exception:
-        return False
+        return None
 
 
-def is_poppler_available() -> bool:
-    return shutil.which("pdftoppm") is not None or shutil.which("pdftocairo") is not None
+def month_key_now() -> str:
+    now = datetime.now(timezone.utc)
+    return f"{now.year:04d}-{now.month:02d}"
 
 
-# ---- Extraction: DOCX ----
-def extract_text_from_docx(data: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        doc = Document(tmp.name)
-        parts = []
-        for p in doc.paragraphs:
-            if p.text and p.text.strip():
-                parts.append(p.text.strip())
-        return "\n".join(parts).strip()
+def get_subscription(user_id: str) -> Dict[str, Any]:
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("select * from subscriptions where user_id=%s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                # create default free
+                cur.execute(
+                    "insert into subscriptions (user_id, plan, status) values (%s, 'free', 'active')",
+                    (user_id,),
+                )
+                conn.commit()
+                return {"user_id": user_id, "plan": "free", "status": "active"}
+            return dict(row)
 
 
-# ---- Extraction: Image OCR ----
-def ocr_image_bytes(data: bytes) -> str:
-    if not is_tesseract_available():
-        raise HTTPException(status_code=500, detail="OCR not available (tesseract missing)")
-    try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        txt = pytesseract.image_to_string(img)
-        return (txt or "").strip()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image OCR failed: {str(e)}")
+def increment_usage(user_id: str) -> int:
+    mk = month_key_now()
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                insert into usage_monthly (user_id, month, scans_used)
+                values (%s, %s, 1)
+                on conflict (user_id, month)
+                do update set scans_used = usage_monthly.scans_used + 1
+                returning scans_used
+                """,
+                (user_id, mk),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["scans_used"])
 
 
-# ---- Extraction: PDF text ----
-def extract_text_from_pdf_text_layer(data: bytes) -> str:
-    """Extract selectable text (no OCR)."""
-    try:
-        reader = PdfReader(io.BytesIO(data))
-        out = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                out.append(t)
-        return "\n".join(out).strip()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"PDF text extraction failed: {str(e)}")
+def get_usage(user_id: str) -> int:
+    mk = month_key_now()
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("select scans_used from usage_monthly where user_id=%s and month=%s", (user_id, mk))
+            row = cur.fetchone()
+            return int(row["scans_used"]) if row else 0
 
 
-def ocr_scanned_pdf(data: bytes, max_pages: int = MAX_PDF_PAGES_OCR) -> str:
-    """Convert first N pages to images then OCR each page."""
-    if not is_poppler_available():
-        raise HTTPException(status_code=500, detail="PDF OCR not available (poppler missing)")
-    if not is_tesseract_available():
-        raise HTTPException(status_code=500, detail="PDF OCR not available (tesseract missing)")
-
-    try:
-        # dpi 200 = good balance
-        images = convert_from_bytes(data, dpi=200, first_page=1, last_page=max_pages)
-        chunks = []
-        for idx, img in enumerate(images, start=1):
-            page_txt = pytesseract.image_to_string(img)
-            page_txt = (page_txt or "").strip()
-            if page_txt:
-                chunks.append(f"[PAGE {idx}]\n{page_txt}")
-        return "\n\n".join(chunks).strip()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Scanned PDF OCR failed: {str(e)}")
+def check_ent_api_key(x_api_key: Optional[str]) -> Optional[str]:
+    # Enterprise integration can use API keys without Supabase login.
+    if not x_api_key:
+        return None
+    # Hash it
+    digest = hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select user_id from api_keys where api_key_hash=%s and active=true limit 1",
+                (digest,),
+            )
+            row = cur.fetchone()
+            return row["user_id"] if row else None
 
 
-def smart_extract_pdf(data: bytes) -> Dict[str, Any]:
-    """
-    Strategy:
-    1) Try text-layer extraction.
-    2) If text is too small, OCR first N pages.
-    """
-    text_layer = extract_text_from_pdf_text_layer(data)
-    if len(text_layer.strip()) >= 200:
-        return {"method": "pdf_text_layer", "text": text_layer}
-
-    # fallback to OCR if looks scanned
-    ocr_text = ocr_scanned_pdf(data)
-    return {"method": "pdf_ocr", "text": ocr_text}
+# -----------------------------
+# Models
+# -----------------------------
+class AnalyzeIn(BaseModel):
+    text: str
 
 
-# ---- AI Scan (OpenAI) ----
-def local_heuristic_scan(text: str) -> Dict[str, Any]:
-    """Fallback scoring when OpenAI is unavailable or quota exceeded."""
-    t = text.lower()
+# -----------------------------
+# Simple “scanner” placeholder
+# (Swap later with your AI model)
+# -----------------------------
+def basic_risk_scan(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+    signals = []
+    score = 0
 
-    patterns = {
-        "urgency_pressure": [
-            "today only", "last chance", "limited time", "only today", "book now",
-            "final offer", "ending soon", "before it’s gone", "few units left"
-        ],
-        "price_anchoring": ["was ", "before ", "discount", "save ", "reduced", "special price"],
-        "vague_terms": ["guaranteed", "assured", "no risk", "100%", "sure shot", "best deal"],
-        "missing_details": ["dm for", "call for", "details later", "will share", "on request"],
-        "payment_risk": ["cash only", "no receipt", "off the record", "under table", "outside contract"],
-    }
+    def hit(phrase, points, reason):
+        nonlocal score
+        if phrase in t:
+            signals.append(reason)
+            score += points
 
-    scores = {}
-    hits = {}
-    for k, lst in patterns.items():
-        count = sum(1 for p in lst if p in t)
-        scores[k] = min(100, count * 25)
-        if count:
-            hits[k] = [p for p in lst if p in t][:5]
+    hit("limited time", 15, "Urgency pressure detected")
+    hit("last unit", 15, "Artificial scarcity language detected")
+    hit("guaranteed returns", 20, "Suspicious guarantee claim detected")
+    hit("no questions asked", 10, "High-pressure reassurance detected")
+    hit("book now", 10, "Call-to-action pressure detected")
 
-    overall = int(min(100, sum(scores.values()) / max(1, len(scores))))
-    confidence = 0.55 if overall > 0 else 0.45
-
-    risks = []
-    if scores.get("urgency_pressure", 0) >= 25:
-        risks.append("High-pressure urgency language detected (can signal manipulation).")
-    if scores.get("payment_risk", 0) >= 25:
-        risks.append("Potential payment/receipt risk language detected (verify receipts/contract terms).")
-    if scores.get("missing_details", 0) >= 25:
-        risks.append("Key details appear withheld ('call/DM for details'). Ask for written terms.")
-    if scores.get("vague_terms", 0) >= 25:
-        risks.append("Overconfident claims detected ('guaranteed', 'no risk'). Validate via documents.")
-
-    summary = "Heuristic scan completed (AI unavailable). Review key risk signals and verify with official documents."
+    score = min(score, 100)
+    label = "Low" if score < 20 else "Medium" if score < 50 else "High"
 
     return {
-        "mode": "heuristic",
-        "summary": summary,
-        "overall_risk_score": overall,
-        "confidence": confidence,
-        "scores": scores,
-        "signals": hits,
-        "risks": risks[:8],
-        "recommendations": [
-            "Request full payment schedule and refund clauses in writing.",
-            "Verify developer / title deed / escrow account details.",
-            "Avoid cash/off-contract payments. Insist on receipts and official invoices."
-        ],
+        "risk_score": score,
+        "risk_label": label,
+        "signals": signals,
+        "summary": "AI-like risk signal summary (MVP placeholder). Replace with model output.",
+        "confidence": 0.72,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def openai_scan(text: str) -> Dict[str, Any]:
-    if not OPENAI_API_KEY or not OpenAI:
-        raise RuntimeError("OpenAI not configured")
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    system = (
-        "You are DeedSense, a trust & manipulation risk scanner for property investors. "
-        "Analyze the provided text (listing, broker message, deed notes, payment terms, chat). "
-        "Return ONLY valid JSON matching the requested schema. Do not include markdown."
-    )
-
-    schema_hint = {
-        "summary": "string: actionable summary in 4-7 bullet-like sentences",
-        "overall_risk_score": "integer 0-100",
-        "confidence": "number 0-1",
-        "scores": {
-            "urgency_pressure": "0-100",
-            "missing_details": "0-100",
-            "payment_risk": "0-100",
-            "legal_red_flags": "0-100",
-            "too_good_to_be_true": "0-100",
-        },
-        "signals": [
-            {"label": "string", "evidence": "short quote", "why_it_matters": "string"}
-        ],
-        "risks": ["string"],
-        "recommendations": ["string"],
-        "disclaimer": "string"
-    }
-
-    user = (
-        "Analyze this property-related text. "
-        "Focus on manipulation cues, due diligence gaps, payment/contract risks, and missing proof.\n\n"
-        f"TEXT:\n{text}\n\n"
-        "Return JSON in this schema (keys must match):\n"
-        f"{json.dumps(schema_hint)}"
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content or ""
-        content = content.strip()
-
-        # Ensure JSON only (strip common junk)
-        content = re.sub(r"^\s*```(?:json)?\s*", "", content)
-        content = re.sub(r"\s*```\s*$", "", content).strip()
-
-        data = json.loads(content)
-
-        # minimal validation / defaults
-        data.setdefault("disclaimer", "Not legal advice. Verify with official documents and professional due diligence.")
-        data["mode"] = "openai"
-        return data
-
-    except Exception as e:
-        raise RuntimeError(str(e))
-
-
-def run_scan_pipeline(raw_text: str) -> Dict[str, Any]:
-    raw_text = raw_text or ""
-    if not raw_text.strip():
-        raise HTTPException(status_code=400, detail="No text extracted/provided to analyze.")
-
-    trimmed = clamp_text(raw_text, MAX_CHARS_TO_MODEL)
-    cleaned = clean_for_analysis(trimmed)
-
-    # Try OpenAI first; fallback to heuristic
-    try:
-        result = openai_scan(cleaned)
-        return result
-    except Exception as e:
-        # common quota error 429 etc
-        fallback = local_heuristic_scan(cleaned)
-        fallback["openai_error"] = str(e)
-        return fallback
-
-
-# ---- Routes ----
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "service": APP_NAME,
-        "ocr_available": is_tesseract_available(),
-        "poppler_available": is_poppler_available(),
-        "openai_configured": bool(OPENAI_API_KEY),
-        "max_upload_mb": MAX_UPLOAD_MB,
-        "max_pdf_pages_ocr": MAX_PDF_PAGES_OCR,
-    }
+    return {"ok": True}
+
+
+@app.get("/me")
+def me(authorization: Optional[str] = Header(default=None)):
+    u = get_user_from_bearer(authorization)
+    if not u or not u.get("user_id"):
+        return {"signed_in": False}
+    sub = get_subscription(u["user_id"])
+    usage = get_usage(u["user_id"])
+    return {"signed_in": True, "user": u, "subscription": sub, "usage_month": usage, "free_limit": DEFAULT_FREE_SCANS}
 
 
 @app.post("/analyze")
-def analyze_text(payload: AnalyzeTextRequest):
-    txt = payload.text or ""
-    result = run_scan_pipeline(txt)
-    return {
-        "source": payload.source or "text",
-        "extracted_text_preview": clamp_text(txt, 800),
-        "result": result,
-    }
+def analyze(payload: AnalyzeIn, authorization: Optional[str] = Header(default=None), x_api_key: Optional[str] = Header(default=None)):
+    # Allow enterprise API key OR signed-in token
+    user_id = check_ent_api_key(x_api_key)
+    if not user_id:
+        u = get_user_from_bearer(authorization)
+        if not u or not u.get("user_id"):
+            raise HTTPException(status_code=401, detail="Sign in required (or Enterprise API key).")
+        user_id = u["user_id"]
 
+    sub = get_subscription(user_id)
+    plan = (sub.get("plan") or "free").lower()
+    status = (sub.get("status") or "active").lower()
 
-@app.post("/analyze-file")
-async def analyze_file(request: Request, file: UploadFile = File(...)):
-    # Read safely with size cap
-    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    data = await file.read()
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB}MB.")
+    if plan != "free" and status not in ["active", "trialing"]:
+        raise HTTPException(status_code=402, detail="Subscription not active. Please renew to continue.")
 
-    filename = (file.filename or "").lower()
-    content_type = (file.content_type or "").lower()
+    if plan == "free":
+        used = get_usage(user_id)
+        if used >= DEFAULT_FREE_SCANS:
+            raise HTTPException(status_code=402, detail=f"Free scans limit reached ({DEFAULT_FREE_SCANS}/month). Upgrade to Pro for unlimited scans.")
+        new_used = increment_usage(user_id)
+    else:
+        new_used = get_usage(user_id)
 
-    extracted = ""
-    method = "unknown"
+    result = basic_risk_scan(payload.text)
 
-    # Decide by extension first, then by content-type
-    try:
-        if filename.endswith(".pdf") or "pdf" in content_type:
-            out = smart_extract_pdf(data)
-            method = out["method"]
-            extracted = out["text"]
-
-        elif filename.endswith(".docx") or "word" in content_type or "officedocument" in content_type:
-            extracted = extract_text_from_docx(data)
-            method = "docx"
-
-        elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg") or "image/" in content_type:
-            extracted = ocr_image_bytes(data)
-            method = "image_ocr"
-
-        elif filename.endswith(".txt") or "text/plain" in content_type:
-            extracted = data.decode("utf-8", errors="ignore")
-            method = "txt"
-
-        else:
-            raise HTTPException(
-                status_code=415,
-                detail="Unsupported file type. Upload PDF, DOCX, TXT, JPG, PNG."
+    # Save history only for signed-in users (not for API-key-only if you prefer).
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "insert into scan_history (user_id, input_type, filename, result_json) values (%s, %s, %s, %s)",
+                (user_id, "text", None, json.dumps(result)),
             )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract text: {str(e)}")
+        conn.commit()
 
-    extracted = (extracted or "").strip()
-    if not extracted:
-        raise HTTPException(status_code=400, detail="No text could be extracted from this file.")
+    return {"plan": plan, "usage_month": new_used, "result": result}
 
-    result = run_scan_pipeline(extracted)
 
-    return {
-        "source": "file",
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "extraction_method": method,
-        "extracted_text_preview": clamp_text(extracted, 1200),
-        "result": result,
-    }
+@app.get("/history")
+def history(authorization: Optional[str] = Header(default=None)):
+    u = get_user_from_bearer(authorization)
+    if not u or not u.get("user_id"):
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    user_id = u["user_id"]
+
+    sub = get_subscription(user_id)
+    plan = (sub.get("plan") or "free").lower()
+    if plan == "free":
+        # free has no history
+        return {"items": [], "note": "History available on Pro/Enterprise."}
+
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select id, created_at, input_type, filename, result_json from scan_history where user_id=%s order by created_at desc limit 50",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            return {"items": rows}
+
+
+# -----------------------------
+# Stripe Billing
+# -----------------------------
+@app.post("/billing/create-checkout-session")
+async def create_checkout_session(request: Request, authorization: Optional[str] = Header(default=None)):
+    u = get_user_from_bearer(authorization)
+    if not u or not u.get("user_id"):
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured.")
+
+    body = await request.json()
+    billing = body.get("billing", "monthly")  # monthly/yearly
+
+    price_id = STRIPE_PRICE_PRO_MONTHLY if billing == "monthly" else STRIPE_PRICE_PRO_YEARLY
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Stripe price ID not configured for selected billing.")
+
+    user_id = u["user_id"]
+
+    # create/find stripe customer
+    sub = get_subscription(user_id)
+    customer_id = sub.get("stripe_customer_id")
+
+    if not customer_id:
+        customer = stripe.Customer.create(
+            email=u.get("email"),
+            metadata={"user_id": user_id},
+        )
+        customer_id = customer["id"]
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("update subscriptions set stripe_customer_id=%s where user_id=%s", (customer_id, user_id))
+            conn.commit()
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=customer_id,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=body.get("success_url", "https://deedsense-ui.onrender.com/?success=1"),
+        cancel_url=body.get("cancel_url", "https://deedsense-ui.onrender.com/?canceled=1"),
+        metadata={"user_id": user_id, "plan": "pro"},
+    )
+    return {"url": session.url}
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe webhook secret not configured.")
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    # Handle subscription events
+    etype = event["type"]
+    data = event["data"]["object"]
+
+    def upsert_subscription(user_id: str, plan: str, status: str, sub_id: Optional[str], period_end: Optional[int]):
+        ts = datetime.fromtimestamp(period_end, tz=timezone.utc) if period_end else None
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    insert into subscriptions (user_id, plan, status, stripe_subscription_id, current_period_end)
+                    values (%s, %s, %s, %s, %s)
+                    on conflict (user_id)
+                    do update set plan=excluded.plan, status=excluded.status, stripe_subscription_id=excluded.stripe_subscription_id, current_period_end=excluded.current_period_end
+                """, (user_id, plan, status, sub_id, ts))
+            conn.commit()
+
+    if etype in ["checkout.session.completed"]:
+        user_id = data.get("metadata", {}).get("user_id")
+        plan = data.get("metadata", {}).get("plan", "pro")
+        # Subscription created after checkout
+        # We'll rely on subscription.updated events too.
+        if user_id:
+            upsert_subscription(user_id, plan, "active", None, None)
+
+    if etype in ["customer.subscription.updated", "customer.subscription.created"]:
+        sub_id = data.get("id")
+        status = data.get("status")
+        period_end = data.get("current_period_end")
+        user_id = (data.get("metadata") or {}).get("user_id")
+
+        # If metadata absent, try customer metadata
+        if not user_id and data.get("customer"):
+            cust = stripe.Customer.retrieve(data["customer"])
+            user_id = (cust.get("metadata") or {}).get("user_id")
+
+        if user_id:
+            plan = "pro"  # map price IDs if you want multiple pro tiers
+            upsert_subscription(user_id, plan, status, sub_id, period_end)
+
+    if etype in ["customer.subscription.deleted"]:
+        sub_id = data.get("id")
+        status = "canceled"
+        user_id = (data.get("metadata") or {}).get("user_id")
+        if not user_id and data.get("customer"):
+            cust = stripe.Customer.retrieve(data["customer"])
+            user_id = (cust.get("metadata") or {}).get("user_id")
+        if user_id:
+            upsert_subscription(user_id, "free", status, sub_id, None)
+
+    return {"received": True}
+
+
+# -----------------------------
+# Admin (simple)
+# Admin is defined by Supabase JWT "role" claim == "admin"
+# -----------------------------
+@app.get("/admin/users")
+def admin_users(authorization: Optional[str] = Header(default=None)):
+    u = get_user_from_bearer(authorization)
+    if not u or u.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only.")
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("select user_id, plan, status, current_period_end from subscriptions order by user_id asc limit 200")
+            return {"items": cur.fetchall()}
