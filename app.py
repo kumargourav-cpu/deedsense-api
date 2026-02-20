@@ -1,19 +1,16 @@
 import os
 import io
+import re
 import json
+import math
 import time
 import hashlib
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
-import jwt  # PyJWT
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-
-# Optional DB (for usage/history/profile)
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from pydantic import BaseModel
 
 # Extraction libs
 from pypdf import PdfReader
@@ -22,129 +19,64 @@ from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
 
+# Optional: history in Postgres later
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 
 # -----------------------------
-# Config
+# ENV CONFIG
 # -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")  # REQUIRED for profile enforcement
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://deedsense-ui.onrender.com")
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-
-DEFAULT_FREE_SCANS = int(os.getenv("DEFAULT_FREE_SCANS", "5"))
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
-OCR_LANG = os.getenv("OCR_LANG", "eng")  # e.g. "eng" or "eng+ara"
-
-# Security / rate-limit
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))  # per IP
-RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "10"))  # short burst
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "18"))
+OCR_LANG = os.getenv("OCR_LANG", "eng+ara")   # good for UAE context
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
+DATABASE_URL = os.getenv("DATABASE_URL")  # optional
 
 
-app = FastAPI(title="DeedSense API", version="1.1.0")
+# -----------------------------
+# APP
+# -----------------------------
+app = FastAPI(title="DeedSense API", version="2.0.0")
 
-# CORS NOTE:
-# If allow_credentials=True, do NOT use allow_origins=["*"] in production.
-origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else ["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Basic in-memory rate limiter (simple but effective on single Render instance)
-# -----------------------------
-_ip_hits: Dict[str, List[float]] = {}  # { ip: [timestamps...] }
-
-
-def _cleanup_hits(ip: str, window_seconds: int = 60):
-    now = time.time()
-    hits = _ip_hits.get(ip, [])
-    hits = [t for t in hits if now - t < window_seconds]
-    _ip_hits[ip] = hits
-
-
-def _rate_limit(ip: str):
-    _cleanup_hits(ip)
-    hits = _ip_hits.get(ip, [])
-    # Allow small burst but limit sustained
-    if len(hits) >= RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
-    hits.append(time.time())
-    _ip_hits[ip] = hits
-
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    ip = request.client.host if request.client else "unknown"
-    # Rate-limit only sensitive endpoints
-    if request.url.path in ["/extract", "/extract-and-analyze", "/analyze-text", "/history", "/profile", "/me"]:
-        _rate_limit(ip)
-    return await call_next(request)
-
 
 # -----------------------------
-# DB Helpers
+# DB (Optional)
 # -----------------------------
+def db_enabled() -> bool:
+    return bool(DATABASE_URL)
+
 def db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-
-def db_enabled() -> bool:
-    return bool(DATABASE_URL)
-
-
 def init_db():
     if not db_enabled():
-        # We want profile enforcement; no DB = no production readiness.
         return
-
     with db() as conn:
         with conn.cursor() as cur:
-            # Needed for gen_random_uuid()
-            cur.execute("create extension if not exists pgcrypto;")
-
             cur.execute("""
-            create table if not exists profiles (
-              user_id text primary key,
-              email text,
-              full_name text,
-              country text,
-              investor_type text,   -- e.g. 'End Buyer' | 'Investor' | 'Agent' | 'Developer'
-              created_at timestamptz not null default now(),
-              updated_at timestamptz not null default now()
-            );
-
-            create table if not exists subscriptions (
-              user_id text primary key,
-              plan text not null default 'free',
-              status text default 'active'
-            );
-
-            create table if not exists usage_monthly (
-              user_id text not null,
-              month text not null,
-              scans_used int not null default 0,
-              primary key (user_id, month)
-            );
-
-            create table if not exists scan_history (
+            create table if not exists scan_history_public (
               id uuid default gen_random_uuid() primary key,
-              user_id text not null,
               created_at timestamptz not null default now(),
               input_type text not null,
               filename text,
+              lang text,
               extracted_text_hash text,
               result_json jsonb not null
             );
-
-            create index if not exists idx_scan_history_user on scan_history(user_id, created_at desc);
+            create index if not exists idx_scan_history_public_created on scan_history_public(created_at desc);
             """)
         conn.commit()
-
 
 @app.on_event("startup")
 def on_startup():
@@ -152,487 +84,611 @@ def on_startup():
 
 
 # -----------------------------
-# Auth Helpers (Supabase JWT)
+# UTILS
 # -----------------------------
-def get_user_from_bearer(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return None
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    token = auth_header.replace("Bearer ", "").strip()
-    if not SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET not configured")
-
-    try:
-        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        return {
-            "user_id": payload.get("sub"),
-            "email": payload.get("email"),
-            "role": payload.get("role"),
-        }
-    except Exception:
-        return None
-
-
-def require_user(authorization: Optional[str]) -> Dict[str, Any]:
-    u = get_user_from_bearer(authorization)
-    if not u or not u.get("user_id"):
-        raise HTTPException(status_code=401, detail="Sign in required.")
-    return u
-
-
-def month_key_now() -> str:
-    now = datetime.now(timezone.utc)
-    return f"{now.year:04d}-{now.month:02d}"
-
-
-def get_subscription(user_id: str) -> Dict[str, Any]:
-    if not db_enabled():
-        return {"user_id": user_id, "plan": "free", "status": "active"}
-
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("select * from subscriptions where user_id=%s", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                cur.execute("insert into subscriptions (user_id, plan, status) values (%s, 'free', 'active')", (user_id,))
-                conn.commit()
-                return {"user_id": user_id, "plan": "free", "status": "active"}
-            return dict(row)
-
-
-def get_usage(user_id: str) -> int:
-    if not db_enabled():
-        return 0
-    mk = month_key_now()
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("select scans_used from usage_monthly where user_id=%s and month=%s", (user_id, mk))
-            row = cur.fetchone()
-            return int(row["scans_used"]) if row else 0
-
-
-def increment_usage(user_id: str) -> int:
-    if not db_enabled():
-        return 0
-    mk = month_key_now()
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                insert into usage_monthly (user_id, month, scans_used)
-                values (%s, %s, 1)
-                on conflict (user_id, month)
-                do update set scans_used = usage_monthly.scans_used + 1
-                returning scans_used
-                """,
-                (user_id, mk),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return int(row["scans_used"])
-
-
-# -----------------------------
-# Profile enforcement
-# -----------------------------
-def get_profile(user_id: str) -> Optional[Dict[str, Any]]:
-    if not db_enabled():
-        return None
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("select * from profiles where user_id=%s", (user_id,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def require_profile(user_id: str):
-    if not db_enabled():
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured (profile required).")
-    prof = get_profile(user_id)
-    # Minimal “complete profile” rule:
-    if not prof or not prof.get("full_name") or not prof.get("country") or not prof.get("investor_type"):
-        raise HTTPException(status_code=403, detail="PROFILE_REQUIRED")
-    return prof
-
-
-class ProfileIn(BaseModel):
-    full_name: str
-    country: str
-    investor_type: str
-
-
-# -----------------------------
-# Scan Logic (MVP placeholder)
-# -----------------------------
-def basic_risk_scan(text: str) -> Dict[str, Any]:
-    t = (text or "").lower()
-    signals: List[str] = []
-    score = 0
-
-    def hit(phrase: str, points: int, reason: str):
-        nonlocal score
-        if phrase in t:
-            signals.append(reason)
-            score += points
-
-    hit("limited time", 15, "Urgency pressure detected")
-    hit("last unit", 15, "Scarcity language detected")
-    hit("guaranteed returns", 20, "Suspicious guarantee claim detected")
-    hit("no questions asked", 10, "Over-reassurance pressure detected")
-    hit("book now", 10, "CTA pressure detected")
-
-    score = min(score, 100)
-    label = "Low" if score < 20 else "Medium" if score < 50 else "High"
-
-    return {
-        "scores": {
-            "risk": score,
-            "trust": max(0, 100 - score),
-            "manipulation": min(100, score + (10 if signals else 0)),
-        },
-        "risk_label": label,
-        "red_flags": signals,
-        "summary": "MVP risk signal summary. Replace with your model output later.",
-        "confidence": 0.72,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
-
-
-# -----------------------------
-# Safe text extraction
-# -----------------------------
 def enforce_file_size(file_bytes: bytes):
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
     if len(file_bytes) > max_bytes:
         raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB}MB.")
 
+def sha256_text(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
-def extract_text_from_pdf(file_bytes: bytes) -> Dict[str, Any]:
+def safe_strip(s: str) -> str:
+    return (s or "").replace("\x00", "").strip()
+
+def clamp(n: float, a: float, b: float) -> float:
+    return max(a, min(b, n))
+
+def detect_language_rough(text: str) -> str:
+    """
+    Lightweight heuristic (no external services):
+    - Arabic detection via Unicode ranges
+    - Hindi via Devanagari range
+    - else English
+    """
+    t = text or ""
+    if re.search(r"[\u0600-\u06FF]", t):
+        return "ar"
+    if re.search(r"[\u0900-\u097F]", t):
+        return "hi"
+    # crude French/Spanish hints:
+    if re.search(r"\b(le|la|les|des|une|un|et|avec)\b", t.lower()):
+        return "fr"
+    if re.search(r"\b(el|la|los|las|una|un|y|con)\b", t.lower()):
+        return "es"
+    return "en"
+
+
+# -----------------------------
+# SAFE TEXT EXTRACTION
+# -----------------------------
+def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+    """
+    Strategy:
+    1) Try normal PDF text extraction (pypdf)
+    2) If too little text, OCR scan pages via pdf2image + pytesseract
+    """
     enforce_file_size(file_bytes)
+    meta = {"mode": "pdf-text", "pages": None, "ocr_used": False}
 
     extracted = ""
-    pages = 0
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        pages = len(reader.pages)
-        parts = [(page.extract_text() or "") for page in reader.pages]
-        extracted = "\n".join(parts).strip()
+        meta["pages"] = len(reader.pages)
+        parts = []
+        for page in reader.pages[:100]:
+            parts.append(page.extract_text() or "")
+        extracted = safe_strip("\n".join(parts))
     except Exception:
         extracted = ""
 
-    meta = {"pages": pages, "ocr": False}
+    # OCR fallback
+    if len(extracted) < 60:
+        meta["mode"] = "pdf-ocr"
+        meta["ocr_used"] = True
 
-    # OCR fallback for scanned PDFs
-    if len(extracted) < 40:
-        images = convert_from_bytes(file_bytes, dpi=220)  # poppler required
+        try:
+            images = convert_from_bytes(file_bytes, dpi=220)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"PDF OCR failed (poppler missing?): {str(e)}")
+
         ocr_parts = []
-        for img in images[:20]:  # safety: limit pages
+        for img in images[:PDF_OCR_MAX_PAGES]:
             ocr_parts.append(pytesseract.image_to_string(img, lang=OCR_LANG))
-        extracted = "\n".join(ocr_parts).strip()
-        meta["ocr"] = True
-        meta["pages"] = min(len(images), 20)
+        extracted = safe_strip("\n".join(ocr_parts))
 
-    return {"text": extracted, "meta": meta}
+    return extracted, meta
 
 
-def extract_text_from_docx(file_bytes: bytes) -> Dict[str, Any]:
+def extract_text_from_docx(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
     enforce_file_size(file_bytes)
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return {"text": "\n".join([p.text for p in doc.paragraphs]).strip(), "meta": {"ocr": False}}
+    d = docx.Document(io.BytesIO(file_bytes))
+    txt = "\n".join([p.text for p in d.paragraphs])
+    return safe_strip(txt), {"mode": "docx", "ocr_used": False}
 
 
-def extract_text_from_image(file_bytes: bytes) -> Dict[str, Any]:
-    enforce_file_size(file_bytes)
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    return {"text": pytesseract.image_to_string(img, lang=OCR_LANG).strip(), "meta": {"ocr": True}}
-
-
-def extract_text_from_txt(file_bytes: bytes) -> Dict[str, Any]:
+def extract_text_from_txt(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
     enforce_file_size(file_bytes)
     try:
-        t = file_bytes.decode("utf-8").strip()
+        return safe_strip(file_bytes.decode("utf-8")), {"mode": "txt", "ocr_used": False}
     except Exception:
-        t = file_bytes.decode("latin-1", errors="ignore").strip()
-    return {"text": t, "meta": {"ocr": False}}
+        return safe_strip(file_bytes.decode("latin-1", errors="ignore")), {"mode": "txt", "ocr_used": False}
+
+
+def extract_text_from_image(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+    enforce_file_size(file_bytes)
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    txt = pytesseract.image_to_string(img, lang=OCR_LANG)
+    return safe_strip(txt), {"mode": "image-ocr", "ocr_used": True}
 
 
 # -----------------------------
-# API Models
+# ANALYSIS ENGINE (NO OPENAI)
+# Investor-grade structured heuristics
+# -----------------------------
+RISK_DIMENSIONS = [
+    ("manipulation", "Manipulation & Pressure"),
+    ("claims", "Claims & Guarantees"),
+    ("legal", "Legal & Compliance"),
+    ("payments", "Payments & Financial Risk"),
+    ("documentation", "Documentation Gaps"),
+    ("transparency", "Transparency & Verifiability"),
+    ("identity", "Identity & Authority Signals"),
+]
+
+PATTERNS = {
+    "urgency": [
+        r"\blimited time\b",
+        r"\bonly today\b",
+        r"\blast chance\b",
+        r"\bfinal offer\b",
+        r"\bbook now\b",
+        r"\bact now\b",
+        r"\b24 hours\b",
+    ],
+    "scarcity": [
+        r"\blast unit\b",
+        r"\bonly \d+ left\b",
+        r"\bexclusive\b",
+        r"\bnot available later\b",
+    ],
+    "guarantees": [
+        r"\bguaranteed returns?\b",
+        r"\b100% guarantee\b",
+        r"\bno risk\b",
+        r"\brisk[- ]free\b",
+        r"\bprofit guaranteed\b",
+    ],
+    "anti_due_diligence": [
+        r"\bno questions asked\b",
+        r"\btrust me\b",
+        r"\bdon't worry about\b",
+        r"\bno need to\b.*\bverify\b",
+    ],
+    "document_gaps": [
+        r"\bnot available\b.*\bdocuments?\b",
+        r"\bwill share later\b",
+        r"\bon request\b",
+        r"\bverbally\b",
+    ],
+    "authority_push": [
+        r"\bCEO\b",
+        r"\bchairman\b",
+        r"\bgovernment\b",
+        r"\bofficial\b",
+        r"\blicensed\b",
+        r"\bapproved\b",
+    ],
+    "payment_risk": [
+        r"\bcash only\b",
+        r"\bcrypto\b",
+        r"\buntraceable\b",
+        r"\badvance\b.*\bnon[- ]refundable\b",
+        r"\bdeposit\b.*\bno refund\b",
+        r"\bpay to personal\b",
+    ],
+}
+
+NEGATIVE_SIGNALS = [
+    ("contains_escrow", r"\bescrow\b|\btrust account\b|\bRERA\b|\bDLD\b", -6),
+    ("has_disclaimer", r"\bsubject to\b|\bterms apply\b|\bverify\b|\bdue diligence\b", -4),
+    ("provides_docs", r"\btitle deed\b|\bOqood\b|\bSPA\b|\bMOU\b|\bpassport\b|\btrade license\b", -5),
+]
+
+def score_text(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+    length = len(t)
+
+    # Base dimensional scoring buckets
+    dims = {k: 0.0 for (k, _) in RISK_DIMENSIONS}
+    evidence = {k: [] for (k, _) in RISK_DIMENSIONS}
+
+    def add(dim: str, points: float, note: str):
+        dims[dim] += points
+        evidence[dim].append(note)
+
+    # Patterns → dimensions
+    def find_hits(key: str) -> int:
+        cnt = 0
+        for p in PATTERNS[key]:
+            if re.search(p, t):
+                cnt += 1
+        return cnt
+
+    urg = find_hits("urgency")
+    sca = find_hits("scarcity")
+    gue = find_hits("guarantees")
+    anti = find_hits("anti_due_diligence")
+    docg = find_hits("document_gaps")
+    auth = find_hits("authority_push")
+    pay = find_hits("payment_risk")
+
+    if urg:
+        add("manipulation", 10 + urg * 6, f"Urgency language detected ({urg} signal(s))")
+    if sca:
+        add("manipulation", 8 + sca * 5, f"Scarcity / exclusivity language detected ({sca} signal(s))")
+    if gue:
+        add("claims", 14 + gue * 7, f"Guarantee-style claims detected ({gue} signal(s))")
+        add("transparency", 6 + gue * 3, "High-precision claims without verifiable proofs often correlate with mis-selling")
+    if anti:
+        add("manipulation", 10 + anti * 6, "Anti-verification or over-reassurance phrasing detected")
+        add("documentation", 8 + anti * 5, "Pressure that discourages due diligence is a strong risk marker")
+    if docg:
+        add("documentation", 12 + docg * 6, "Missing/withheld documentation signals")
+        add("transparency", 8 + docg * 4, "Delayed docs reduce verifiability")
+    if auth:
+        add("identity", 6 + auth * 2, "Authority branding detected (verify via license/registry)")
+    if pay:
+        add("payments", 14 + pay * 6, "High-risk payment instruction pattern detected")
+        add("legal", 6 + pay * 2, "Payment methods can increase compliance and recovery risk")
+
+    # Negative signals reduce risk (good signals)
+    for name, pattern, delta in NEGATIVE_SIGNALS:
+        if re.search(pattern, t):
+            # spread reductions across key dims
+            dims["documentation"] += delta
+            dims["transparency"] += delta
+            dims["legal"] += delta / 2
+            evidence["documentation"].append(f"Positive sign: references verifiable controls ({name})")
+            evidence["transparency"].append(f"Positive sign: references verifiable controls ({name})")
+
+    # Normalize by length (short texts should not get extreme confidence)
+    length_factor = clamp(length / 1200.0, 0.35, 1.0)
+
+    # Build total score
+    raw_total = sum(max(0.0, v) for v in dims.values())
+    raw_total *= length_factor
+
+    # Convert to 0..100 with a saturating curve
+    score = 100 * (1 - math.exp(-raw_total / 85.0))
+    score = clamp(score, 0.0, 100.0)
+
+    # Label
+    if score < 20:
+        label = "Low"
+    elif score < 45:
+        label = "Guarded"
+    elif score < 70:
+        label = "High"
+    else:
+        label = "Critical"
+
+    # Confidence: based on length + number of matched patterns
+    hit_count = urg + sca + gue + anti + docg + auth + pay
+    conf = 0.35 + 0.35 * length_factor + 0.03 * min(hit_count, 8)
+    conf = clamp(conf, 0.35, 0.90)
+
+    # Make category breakdown (0..100)
+    dim_scores = {}
+    for k, _ in RISK_DIMENSIONS:
+        # scale each dim using soft cap
+        v = max(0.0, dims[k]) * length_factor
+        dim_scores[k] = float(clamp(100 * (1 - math.exp(-v / 28.0)), 0, 100))
+
+    # Key recommendations (actionable)
+    tips = build_tips(dim_scores, t)
+
+    # Executive summary
+    summary = build_summary(score, label, dim_scores, hit_count)
+
+    # “What to verify” checklist
+    checklist = build_checklist(dim_scores)
+
+    # Red flags (top evidence)
+    top_flags = []
+    for k, _ in RISK_DIMENSIONS:
+        for ev in evidence[k][:3]:
+            if "Positive sign" not in ev:
+                top_flags.append({"dimension": k, "note": ev})
+    top_flags = top_flags[:10]
+
+    return {
+        "risk_score": round(score, 1),
+        "risk_label": label,
+        "confidence": round(conf, 2),
+        "hit_count": hit_count,
+        "dimensions": dim_scores,
+        "summary": summary,
+        "top_flags": top_flags,
+        "recommendations": tips,
+        "verification_checklist": checklist,
+        "created_at": now_iso(),
+    }
+
+def build_summary(score: float, label: str, dim_scores: Dict[str, float], hits: int) -> str:
+    # Focus on top 2 dims
+    top2 = sorted(dim_scores.items(), key=lambda x: x[1], reverse=True)[:2]
+    def pretty(k: str) -> str:
+        for kk, name in RISK_DIMENSIONS:
+            if kk == k:
+                return name
+        return k
+    if hits == 0 and score < 18:
+        return (
+            "The text contains relatively few high-risk manipulation markers. "
+            "This does NOT confirm legitimacy — it only means the language itself isn’t strongly pressuring or deceptive. "
+            "Proceed with standard verification (developer, agent license, escrow/payment proof, contract terms)."
+        )
+    return (
+        f"Overall risk is **{label}** (score {round(score,1)}/100). "
+        f"Highest risk areas: **{pretty(top2[0][0])}** and **{pretty(top2[1][0])}**. "
+        "This score reflects language-based signals (pressure patterns, unverifiable claims, and documentation/payment risk cues) "
+        "and should be validated with official documents and due diligence."
+    )
+
+def build_tips(dim_scores: Dict[str, float], t: str) -> List[Dict[str, Any]]:
+    tips: List[Dict[str, Any]] = []
+
+    def add(priority: str, title: str, details: str):
+        tips.append({"priority": priority, "title": title, "details": details})
+
+    if dim_scores["payments"] >= 45:
+        add(
+            "High",
+            "Confirm payment safety before transferring anything",
+            "Insist on escrow/trust account routes where applicable, written invoices, and beneficiary matching the legal entity. "
+            "Avoid personal accounts, cash-only requests, or vague payment instructions."
+        )
+
+    if dim_scores["documentation"] >= 45 or dim_scores["transparency"] >= 45:
+        add(
+            "High",
+            "Ask for a document pack — not screenshots",
+            "Request: title deed/Oqood, SPA/MOU, payment plan schedule, developer project number, agent RERA/DLD license (UAE), "
+            "and any reservation forms. Cross-check names, dates, and amounts."
+        )
+
+    if dim_scores["claims"] >= 40:
+        add(
+            "Medium",
+            "Treat guaranteed returns as marketing, not proof",
+            "If returns are promised, ask for the basis: rental comps, occupancy assumptions, fees, service charges, and exit liquidity. "
+            "Verify who is guaranteeing and whether it is contractually enforceable."
+        )
+
+    if dim_scores["manipulation"] >= 40:
+        add(
+            "Medium",
+            "Slow down the decision cycle",
+            "Pressure tactics correlate with mis-selling. Use a 24–48 hour cooling-off rule, compare alternatives, "
+            "and keep communication in writing."
+        )
+
+    # always add baseline
+    add(
+        "Baseline",
+        "Verify identity & authority",
+        "Confirm the agent/broker identity via official license registries where available; validate the developer/project via official portals."
+    )
+    add(
+        "Baseline",
+        "Keep evidence",
+        "Save PDFs, emails, WhatsApp messages, receipts, and call summaries. These matter if disputes arise."
+    )
+
+    return tips[:8]
+
+def build_checklist(dim_scores: Dict[str, float]) -> List[Dict[str, Any]]:
+    items: List[Tuple[str, str, str]] = [
+        ("Documents", "Title deed / Oqood / SPA / MOU", "Ask for originals or official PDFs; verify signatures and entity names."),
+        ("Payments", "Beneficiary verification", "Ensure payment goes to the correct legal entity; match invoice and trade license."),
+        ("Project", "Project registration / permit numbers", "Cross-check the project exists and the unit details match."),
+        ("Fees", "Service charges, admin fees, commissions", "Demand full fee breakdown in writing."),
+        ("Timelines", "Handover date + delay clauses", "Check penalty clauses and what constitutes delay."),
+        ("Refunds", "Cancellation and refund conditions", "Look for non-refundable language and exceptions."),
+        ("KYC", "Agent / broker license", "Verify license validity and authorized scope."),
+        ("Proof", "Marketing claims evidence", "Request supporting data: comps, contracts, and audited statements if offered."),
+    ]
+
+    # promote stronger emphasis based on dimensions
+    out = []
+    for cat, title, why in items:
+        weight = 1
+        if cat == "Payments" and dim_scores["payments"] > 40:
+            weight = 3
+        if cat == "Documents" and dim_scores["documentation"] > 40:
+            weight = 3
+        if cat == "Proof" and dim_scores["claims"] > 35:
+            weight = 2
+        out.append({"category": cat, "item": title, "why": why, "priority": weight})
+
+    out.sort(key=lambda x: x["priority"], reverse=True)
+    return out
+
+
+# -----------------------------
+# I18N (limited, offline)
+# -----------------------------
+I18N = {
+    "en": {
+        "label": {"Low": "Low", "Guarded": "Guarded", "High": "High", "Critical": "Critical"},
+        "disclaimer": "DeedSense provides language-based risk signals, not legal advice. Always verify with official documents and professional due diligence.",
+    },
+    "ar": {
+        "label": {"Low": "منخفض", "Guarded": "حذر", "High": "مرتفع", "Critical": "حرِج"},
+        "disclaimer": "يوفّر DeedSense إشارات مخاطر مبنية على لغة النص وليس نصيحة قانونية. يجب التحقق من الوثائق الرسمية وإجراء العناية الواجبة.",
+    },
+    "hi": {
+        "label": {"Low": "कम", "Guarded": "सावधानी", "High": "उच्च", "Critical": "गंभीर"},
+        "disclaimer": "DeedSense केवल भाषा-आधारित जोखिम संकेत देता है, यह कानूनी सलाह नहीं है। दस्तावेज़ों और ड्यू डिलिजेंस से सत्यापन ज़रूरी है।",
+    },
+    "fr": {
+        "label": {"Low": "Faible", "Guarded": "Prudent", "High": "Élevé", "Critical": "Critique"},
+        "disclaimer": "DeedSense fournit des signaux de risque basés sur le langage, pas un avis juridique. Vérifiez toujours via des documents officiels et une due diligence.",
+    },
+    "es": {
+        "label": {"Low": "Bajo", "Guarded": "Precaución", "High": "Alto", "Critical": "Crítico"},
+        "disclaimer": "DeedSense ofrece señales de riesgo basadas en el lenguaje, no asesoría legal. Verifica con documentos oficiales y due diligence.",
+    },
+}
+
+def localize_result(result: Dict[str, Any], out_lang: str) -> Dict[str, Any]:
+    lang = out_lang if out_lang in I18N else "en"
+    label_map = I18N[lang]["label"]
+    label = result.get("risk_label", "Low")
+    result["risk_label_local"] = label_map.get(label, label)
+    result["disclaimer_local"] = I18N[lang]["disclaimer"]
+    return result
+
+
+# -----------------------------
+# API MODELS
 # -----------------------------
 class AnalyzeTextIn(BaseModel):
     text: str
-    preferred_language: Optional[str] = None
+    out_lang: Optional[str] = "en"
+
+
+class ChatIn(BaseModel):
+    message: str
+    context_text: Optional[str] = ""
+    out_lang: Optional[str] = "en"
 
 
 # -----------------------------
-# Routes
+# ROUTES
 # -----------------------------
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "db": bool(DATABASE_URL),
-        "ocr": True,
         "max_upload_mb": MAX_UPLOAD_MB,
         "ocr_lang": OCR_LANG,
-        "allowed_origins": origins,
-    }
-
-
-@app.get("/me")
-def me(authorization: Optional[str] = Header(default=None)):
-    u = get_user_from_bearer(authorization)
-    if not u or not u.get("user_id"):
-        return {"signed_in": False}
-
-    sub = get_subscription(u["user_id"])
-    usage = get_usage(u["user_id"]) if db_enabled() else None
-    prof = get_profile(u["user_id"]) if db_enabled() else None
-
-    complete = bool(prof and prof.get("full_name") and prof.get("country") and prof.get("investor_type"))
-
-    return {
-        "signed_in": True,
-        "user": u,
-        "profile": prof,
-        "profile_complete": complete,
-        "subscription": sub,
-        "usage_month": usage,
-        "free_limit": DEFAULT_FREE_SCANS,
+        "pdf_ocr_max_pages": PDF_OCR_MAX_PAGES,
         "db_enabled": db_enabled(),
+        "time": now_iso(),
     }
-
-
-@app.get("/profile")
-def profile_get(authorization: Optional[str] = Header(default=None)):
-    u = require_user(authorization)
-    if not db_enabled():
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-    prof = get_profile(u["user_id"])
-    return {"profile": prof}
-
-
-@app.post("/profile")
-def profile_upsert(payload: ProfileIn, authorization: Optional[str] = Header(default=None)):
-    u = require_user(authorization)
-    if not db_enabled():
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into profiles (user_id, email, full_name, country, investor_type, updated_at)
-                values (%s, %s, %s, %s, %s, now())
-                on conflict (user_id)
-                do update set full_name=excluded.full_name, country=excluded.country, investor_type=excluded.investor_type, updated_at=now()
-                """,
-                (u["user_id"], u.get("email"), payload.full_name, payload.country, payload.investor_type),
-            )
-        conn.commit()
-
-    return {"ok": True}
-
-
-def enforce_plan_and_usage(user_id: str) -> Dict[str, Any]:
-    sub = get_subscription(user_id)
-    plan = (sub.get("plan") or "free").lower()
-    status = (sub.get("status") or "active").lower()
-
-    # usage enforcement only if DB enabled
-    usage_month = None
-    if db_enabled():
-        if plan != "free" and status not in ["active", "trialing"]:
-            raise HTTPException(status_code=402, detail="Subscription not active.")
-
-        if plan == "free":
-            used = get_usage(user_id)
-            if used >= DEFAULT_FREE_SCANS:
-                raise HTTPException(status_code=402, detail=f"Free scans limit reached ({DEFAULT_FREE_SCANS}/month).")
-            usage_month = increment_usage(user_id)
-        else:
-            usage_month = get_usage(user_id)
-
-    return {"plan": plan, "usage_month": usage_month}
 
 
 @app.post("/analyze-text")
-def analyze_text(payload: AnalyzeTextIn, authorization: Optional[str] = Header(default=None)):
-    u = require_user(authorization)
+def analyze_text(payload: AnalyzeTextIn):
+    text = safe_strip(payload.text)
+    if len(text) < 10:
+        raise HTTPException(status_code=422, detail="Text too short to analyze.")
+    lang_inferred = detect_language_rough(text)
+    result = score_text(text)
+    result["lang_detected"] = lang_inferred
+    result["input_type"] = "text"
+    result = localize_result(result, payload.out_lang or "en")
 
-    # REQUIRE profile first (prevents anonymous abuse)
-    require_profile(u["user_id"])
-
-    usage = enforce_plan_and_usage(u["user_id"])
-    result = basic_risk_scan(payload.text)
-
+    # optionally store (public, no user)
     if db_enabled():
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "insert into scan_history (user_id, input_type, filename, extracted_text_hash, result_json) values (%s, %s, %s, %s, %s)",
-                    (u["user_id"], "text", None, sha256_text(payload.text), json.dumps(result)),
+                    "insert into scan_history_public (input_type, filename, lang, extracted_text_hash, result_json) values (%s,%s,%s,%s,%s)",
+                    ("text", None, lang_inferred, sha256_text(text), json.dumps(result)),
                 )
             conn.commit()
 
-    return {
-        "title": "DeedSense Report",
-        **usage,
-        "extracted_text": payload.text,
-        **result,
-    }
-
-
-@app.post("/extract")
-async def extract_only(
-    authorization: Optional[str] = Header(default=None),
-    file: UploadFile = File(...),
-):
-    """
-    UI expects: POST /extract -> { text, meta }
-    """
-    u = require_user(authorization)
-    require_profile(u["user_id"])
-
-    filename = file.filename or "upload"
-    content = await file.read()
-    enforce_file_size(content)
-
-    name = filename.lower()
-    ctype = (file.content_type or "").lower()
-
-    try:
-        if name.endswith(".pdf") or "pdf" in ctype:
-            out = extract_text_from_pdf(content)
-            out["meta"]["source"] = filename
-            return out
-
-        if name.endswith(".docx") or "officedocument.wordprocessingml.document" in ctype:
-            out = extract_text_from_docx(content)
-            out["meta"]["source"] = filename
-            return out
-
-        if name.endswith(".txt") or "text/plain" in ctype:
-            out = extract_text_from_txt(content)
-            out["meta"]["source"] = filename
-            return out
-
-        if any(name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or "image/" in ctype:
-            out = extract_text_from_image(content)
-            out["meta"]["source"] = filename
-            return out
-
-        raise HTTPException(status_code=415, detail="Unsupported file type. Use PDF, DOCX, TXT, PNG, JPG, JPEG.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract text: {str(e)}")
+    return {"extracted_text": text, "result": result}
 
 
 @app.post("/extract-and-analyze")
 async def extract_and_analyze(
-    authorization: Optional[str] = Header(default=None),
+    out_lang: str = Form("en"),
     file: UploadFile = File(...),
 ):
-    """
-    Accepts: PDF/DOCX/TXT/PNG/JPG/JPEG
-    Extracts text safely -> runs scan -> returns extracted text + result
-    """
-    u = require_user(authorization)
-    require_profile(u["user_id"])
-
-    usage = enforce_plan_and_usage(u["user_id"])
-
     filename = file.filename or "upload"
-    content = await file.read()
-    enforce_file_size(content)
+    content_type = (file.content_type or "").lower()
+    raw = await file.read()
+    enforce_file_size(raw)
 
     name = filename.lower()
-    ctype = (file.content_type or "").lower()
-
-    extracted_text = ""
-    input_type = "file"
-    meta: Dict[str, Any] = {"source": filename}
+    extracted = ""
+    meta: Dict[str, Any] = {"filename": filename, "content_type": content_type}
 
     try:
-        if name.endswith(".pdf") or "pdf" in ctype:
+        if name.endswith(".pdf") or "pdf" in content_type:
+            extracted, m = extract_text_from_pdf(raw)
+            meta.update(m)
             input_type = "pdf"
-            out = extract_text_from_pdf(content)
-            extracted_text = out["text"]
-            meta.update(out["meta"])
 
-        elif name.endswith(".docx") or "officedocument.wordprocessingml.document" in ctype:
+        elif name.endswith(".docx") or "officedocument.wordprocessingml.document" in content_type:
+            extracted, m = extract_text_from_docx(raw)
+            meta.update(m)
             input_type = "docx"
-            out = extract_text_from_docx(content)
-            extracted_text = out["text"]
-            meta.update(out["meta"])
 
-        elif name.endswith(".txt") or "text/plain" in ctype:
+        elif name.endswith(".txt") or "text/plain" in content_type:
+            extracted, m = extract_text_from_txt(raw)
+            meta.update(m)
             input_type = "txt"
-            out = extract_text_from_txt(content)
-            extracted_text = out["text"]
-            meta.update(out["meta"])
 
-        elif any(name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or "image/" in ctype:
+        elif any(name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or "image/" in content_type:
+            extracted, m = extract_text_from_image(raw)
+            meta.update(m)
             input_type = "image"
-            out = extract_text_from_image(content)
-            extracted_text = out["text"]
-            meta.update(out["meta"])
 
         else:
             raise HTTPException(status_code=415, detail="Unsupported file type. Use PDF, DOCX, TXT, PNG, JPG, JPEG.")
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to extract text: {str(e)}")
 
-    if not extracted_text or len(extracted_text.strip()) < 10:
-        raise HTTPException(status_code=422, detail="No readable text found. If this is a scanned file, ensure OCR is enabled and the scan is clear.")
+    extracted = safe_strip(extracted)
+    if len(extracted) < 10:
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text found. If this is scanned, ensure OCR is enabled and the scan is clear."
+        )
 
-    result = basic_risk_scan(extracted_text)
+    lang_inferred = detect_language_rough(extracted)
+    result = score_text(extracted)
+    result["lang_detected"] = lang_inferred
+    result["input_type"] = input_type
+    result["extract_meta"] = meta
+    result = localize_result(result, out_lang or "en")
 
     if db_enabled():
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "insert into scan_history (user_id, input_type, filename, extracted_text_hash, result_json) values (%s, %s, %s, %s, %s)",
-                    (u["user_id"], input_type, filename, sha256_text(extracted_text), json.dumps(result)),
+                    "insert into scan_history_public (input_type, filename, lang, extracted_text_hash, result_json) values (%s,%s,%s,%s,%s)",
+                    (input_type, filename, lang_inferred, sha256_text(extracted), json.dumps(result)),
                 )
             conn.commit()
 
-    return {
-        "title": "DeedSense Report",
-        **usage,
-        "input_type": input_type,
-        "filename": filename,
-        "meta": meta,
-        "extracted_text": extracted_text,
-        **result,
-    }
+    return {"filename": filename, "extracted_text": extracted, "result": result}
 
 
 @app.get("/history")
-def history(authorization: Optional[str] = Header(default=None)):
+def history(limit: int = 50):
     if not db_enabled():
-        return {"items": [], "note": "DATABASE_URL not set. Enable Postgres to store scan history."}
+        return {"items": [], "note": "DATABASE_URL not set. UI will use local browser history for now."}
 
-    u = require_user(authorization)
-    require_profile(u["user_id"])
-
-    sub = get_subscription(u["user_id"])
-    plan = (sub.get("plan") or "free").lower()
-
-    if plan == "free":
-        return {"items": [], "note": "History is available on Pro/Enterprise (later)."}
-
+    limit = max(1, min(200, int(limit)))
     with db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                "select id, created_at, input_type, filename, result_json from scan_history where user_id=%s order by created_at desc limit 50",
-                (u["user_id"],),
+                "select id, created_at, input_type, filename, lang, result_json from scan_history_public order by created_at desc limit %s",
+                (limit,),
             )
             return {"items": cur.fetchall()}
+
+
+@app.post("/chat")
+def chat(payload: ChatIn):
+    """
+    MVP chat:
+    - Uses offline guidance and your scan context.
+    - Web-research mode can be added later (server-side search integrations).
+    """
+    msg = safe_strip(payload.message)
+    if not msg:
+        raise HTTPException(status_code=422, detail="Message required.")
+
+    ctx = safe_strip(payload.context_text or "")
+    lang = payload.out_lang if payload.out_lang in I18N else "en"
+
+    # Simple intent hints
+    want_properties = bool(re.search(r"\b(find|search|options|properties|projects|area|budget|villa|apartment)\b", msg.lower()))
+    want_risk_help = bool(re.search(r"\b(risk|scam|safe|legit|verify|fraud|trust)\b", msg.lower()))
+
+    base = []
+    base.append("Here’s a practical investor-grade approach based on your message.")
+
+    if ctx and want_risk_help:
+        # quick add-on: recommend verification steps
+        base.append("If you paste the full listing/broker message and payment terms, I can pinpoint pressure language and missing-doc signals.")
+        base.append("Immediate due diligence checklist: verify agent license, project registration, beneficiary verification, escrow/trust account, and contract clauses.")
+
+    if want_properties:
+        # no web search right now (by design)
+        base.append("Property search mode is currently offline in this MVP build (no web queries yet).")
+        base.append("If you share: city/area, budget, purpose (end-use vs investment), timeline, and risk tolerance — I’ll propose a shortlist framework and what to compare.")
+        base.append("Later we can enable Web Research mode to return verified listings with links.")
+
+    base.append("If you want, paste your document text and ask: “What are the top 5 red flags and what should I ask the agent?”")
+
+    answer = "\n\n".join(base)
+
+    # lightweight localization for disclaimers only
+    disclaimer = I18N[lang]["disclaimer"]
+
+    return {"reply": answer, "disclaimer": disclaimer, "mode": "offline-mvp"}
