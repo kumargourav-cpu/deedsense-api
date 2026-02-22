@@ -1,42 +1,33 @@
 import os
 import io
 import re
-import json
 import math
-import time
-import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Extraction libs
 from pypdf import PdfReader
 import docx  # python-docx
 from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
+from langdetect import detect, DetectorFactory
 
-# Optional: history in Postgres later
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
+DetectorFactory.seed = 0  # stable results
 
 # -----------------------------
-# ENV CONFIG
+# Config
 # -----------------------------
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "18"))
-OCR_LANG = os.getenv("OCR_LANG", "eng+ara")   # good for UAE context
-PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
-DATABASE_URL = os.getenv("DATABASE_URL")  # optional
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
+OCR_LANG = os.getenv("OCR_LANG", "eng+ara")  # example: "eng" or "eng+ara"
+MAX_PDF_PAGES_OCR = int(os.getenv("MAX_PDF_PAGES_OCR", "15"))
+PDF_DPI = int(os.getenv("PDF_DPI", "220"))
 
-
-# -----------------------------
-# APP
-# -----------------------------
 app = FastAPI(title="DeedSense API", version="2.0.0")
 
 app.add_middleware(
@@ -47,490 +38,330 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
+# Models
+# -----------------------------
+class AnalyzeIn(BaseModel):
+    text: str
+    preferred_language: Optional[str] = None  # e.g. "en", "ar", "hi", "fr"
+    context: Optional[Dict[str, Any]] = None  # future use (deal metadata)
+
+class ExtractOut(BaseModel):
+    filename: str
+    input_type: str
+    detected_language: str
+    extracted_text: str
+
+class ScanOut(BaseModel):
+    filename: Optional[str]
+    input_type: str
+    detected_language: str
+    preferred_language: str
+    extracted_text: str
+    analysis: Dict[str, Any]
+    charts: Dict[str, Any]
+    checklist: Dict[str, Any]
+    signals: List[Dict[str, Any]]
+    meta: Dict[str, Any]
 
 # -----------------------------
-# DB (Optional)
-# -----------------------------
-def db_enabled() -> bool:
-    return bool(DATABASE_URL)
-
-def db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-def init_db():
-    if not db_enabled():
-        return
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            create table if not exists scan_history_public (
-              id uuid default gen_random_uuid() primary key,
-              created_at timestamptz not null default now(),
-              input_type text not null,
-              filename text,
-              lang text,
-              extracted_text_hash text,
-              result_json jsonb not null
-            );
-            create index if not exists idx_scan_history_public_created on scan_history_public(created_at desc);
-            """)
-        conn.commit()
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-
-# -----------------------------
-# UTILS
+# Helpers
 # -----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def enforce_file_size(file_bytes: bytes):
+def enforce_file_size(b: bytes):
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    if len(file_bytes) > max_bytes:
+    if len(b) > max_bytes:
         raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB}MB.")
 
-def sha256_text(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
+def safe_decode_text(b: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return b.decode(enc, errors="ignore")
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="ignore")
 
-def safe_strip(s: str) -> str:
-    return (s or "").replace("\x00", "").strip()
+def detect_lang(text: str) -> str:
+    t = (text or "").strip()
+    if len(t) < 20:
+        return "en"
+    try:
+        code = detect(t)
+        return code or "en"
+    except Exception:
+        return "en"
 
-def clamp(n: float, a: float, b: float) -> float:
-    return max(a, min(b, n))
-
-def detect_language_rough(text: str) -> str:
-    """
-    Lightweight heuristic (no external services):
-    - Arabic detection via Unicode ranges
-    - Hindi via Devanagari range
-    - else English
-    """
-    t = text or ""
-    if re.search(r"[\u0600-\u06FF]", t):
-        return "ar"
-    if re.search(r"[\u0900-\u097F]", t):
-        return "hi"
-    # crude French/Spanish hints:
-    if re.search(r"\b(le|la|les|des|une|un|et|avec)\b", t.lower()):
-        return "fr"
-    if re.search(r"\b(el|la|los|las|una|un|y|con)\b", t.lower()):
-        return "es"
-    return "en"
-
+def normalize_whitespace(s: str) -> str:
+    s = s.replace("\x00", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 # -----------------------------
-# SAFE TEXT EXTRACTION
+# Extraction
 # -----------------------------
-def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+def extract_pdf_text(pdf_bytes: bytes) -> Tuple[str, str]:
     """
-    Strategy:
-    1) Try normal PDF text extraction (pypdf)
-    2) If too little text, OCR scan pages via pdf2image + pytesseract
+    1) Try pypdf extraction.
+    2) If too little text, OCR fallback (scanned PDF) via pdf2image + pytesseract.
+    Returns (text, mode) where mode is 'pdf-text' or 'pdf-ocr'
     """
-    enforce_file_size(file_bytes)
-    meta = {"mode": "pdf-text", "pages": None, "ocr_used": False}
+    enforce_file_size(pdf_bytes)
 
     extracted = ""
+    mode = "pdf-text"
+
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        meta["pages"] = len(reader.pages)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
         parts = []
-        for page in reader.pages[:100]:
-            parts.append(page.extract_text() or "")
-        extracted = safe_strip("\n".join(parts))
+        for p in reader.pages:
+            parts.append((p.extract_text() or "").strip())
+        extracted = "\n".join([x for x in parts if x]).strip()
     except Exception:
         extracted = ""
 
-    # OCR fallback
-    if len(extracted) < 60:
-        meta["mode"] = "pdf-ocr"
-        meta["ocr_used"] = True
-
-        try:
-            images = convert_from_bytes(file_bytes, dpi=220)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"PDF OCR failed (poppler missing?): {str(e)}")
-
+    # OCR fallback if not enough text
+    if len(extracted) < 80:
+        mode = "pdf-ocr"
+        images = convert_from_bytes(pdf_bytes, dpi=PDF_DPI)
         ocr_parts = []
-        for img in images[:PDF_OCR_MAX_PAGES]:
+        for img in images[:MAX_PDF_PAGES_OCR]:
             ocr_parts.append(pytesseract.image_to_string(img, lang=OCR_LANG))
-        extracted = safe_strip("\n".join(ocr_parts))
+        extracted = "\n".join(ocr_parts)
 
-    return extracted, meta
+    return normalize_whitespace(extracted), mode
 
+def extract_docx_text(docx_bytes: bytes) -> str:
+    enforce_file_size(docx_bytes)
+    d = docx.Document(io.BytesIO(docx_bytes))
+    text = "\n".join([p.text for p in d.paragraphs if p.text])
+    return normalize_whitespace(text)
 
-def extract_text_from_docx(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    enforce_file_size(file_bytes)
-    d = docx.Document(io.BytesIO(file_bytes))
-    txt = "\n".join([p.text for p in d.paragraphs])
-    return safe_strip(txt), {"mode": "docx", "ocr_used": False}
+def extract_image_text(img_bytes: bytes) -> str:
+    enforce_file_size(img_bytes)
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    text = pytesseract.image_to_string(img, lang=OCR_LANG)
+    return normalize_whitespace(text)
 
+def extract_txt_text(txt_bytes: bytes) -> str:
+    enforce_file_size(txt_bytes)
+    return normalize_whitespace(safe_decode_text(txt_bytes))
 
-def extract_text_from_txt(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    enforce_file_size(file_bytes)
-    try:
-        return safe_strip(file_bytes.decode("utf-8")), {"mode": "txt", "ocr_used": False}
-    except Exception:
-        return safe_strip(file_bytes.decode("latin-1", errors="ignore")), {"mode": "txt", "ocr_used": False}
-
-
-def extract_text_from_image(file_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    enforce_file_size(file_bytes)
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    txt = pytesseract.image_to_string(img, lang=OCR_LANG)
-    return safe_strip(txt), {"mode": "image-ocr", "ocr_used": True}
-
+def infer_type(filename: str, content_type: str) -> str:
+    n = (filename or "").lower()
+    ct = (content_type or "").lower()
+    if n.endswith(".pdf") or "pdf" in ct:
+        return "pdf"
+    if n.endswith(".docx") or "wordprocessingml.document" in ct:
+        return "docx"
+    if n.endswith(".txt") or "text/plain" in ct:
+        return "txt"
+    if any(n.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")) or ct.startswith("image/"):
+        return "image"
+    return "unknown"
 
 # -----------------------------
-# ANALYSIS ENGINE (NO OPENAI)
-# Investor-grade structured heuristics
+# Analysis Engine (non-LLM, deterministic)
+# IMPORTANT: This is NOT "research-backed AI" – it’s rules + scoring.
+# It’s designed to be consistent, explainable, and enterprise-style structured.
 # -----------------------------
-RISK_DIMENSIONS = [
-    ("manipulation", "Manipulation & Pressure"),
-    ("claims", "Claims & Guarantees"),
-    ("legal", "Legal & Compliance"),
-    ("payments", "Payments & Financial Risk"),
-    ("documentation", "Documentation Gaps"),
-    ("transparency", "Transparency & Verifiability"),
-    ("identity", "Identity & Authority Signals"),
+RISK_CATEGORIES = [
+    ("manipulation", "Manipulation & pressure"),
+    ("financial", "Financial claims & terms"),
+    ("legal", "Legal / ownership clarity"),
+    ("documentation", "Missing documents / proof"),
+    ("quality", "Listing quality & ambiguity"),
 ]
 
-PATTERNS = {
-    "urgency": [
-        r"\blimited time\b",
-        r"\bonly today\b",
-        r"\blast chance\b",
-        r"\bfinal offer\b",
-        r"\bbook now\b",
-        r"\bact now\b",
-        r"\b24 hours\b",
-    ],
-    "scarcity": [
-        r"\blast unit\b",
-        r"\bonly \d+ left\b",
-        r"\bexclusive\b",
-        r"\bnot available later\b",
-    ],
-    "guarantees": [
-        r"\bguaranteed returns?\b",
-        r"\b100% guarantee\b",
-        r"\bno risk\b",
-        r"\brisk[- ]free\b",
-        r"\bprofit guaranteed\b",
-    ],
-    "anti_due_diligence": [
-        r"\bno questions asked\b",
-        r"\btrust me\b",
-        r"\bdon't worry about\b",
-        r"\bno need to\b.*\bverify\b",
-    ],
-    "document_gaps": [
-        r"\bnot available\b.*\bdocuments?\b",
-        r"\bwill share later\b",
-        r"\bon request\b",
-        r"\bverbally\b",
-    ],
-    "authority_push": [
-        r"\bCEO\b",
-        r"\bchairman\b",
-        r"\bgovernment\b",
-        r"\bofficial\b",
-        r"\blicensed\b",
-        r"\bapproved\b",
-    ],
-    "payment_risk": [
-        r"\bcash only\b",
-        r"\bcrypto\b",
-        r"\buntraceable\b",
-        r"\badvance\b.*\bnon[- ]refundable\b",
-        r"\bdeposit\b.*\bno refund\b",
-        r"\bpay to personal\b",
-    ],
-}
+SIGNALS = [
+    # Manipulation / pressure
+    ("limited time", "manipulation", 12, "Urgency pressure: 'limited time'"),
+    ("last unit", "manipulation", 12, "Scarcity pressure: 'last unit'"),
+    ("book now", "manipulation", 8, "CTA pressure: 'book now'"),
+    ("today only", "manipulation", 10, "Deadline pressure: 'today only'"),
+    ("guaranteed", "financial", 14, "Guarantee language: 'guaranteed'"),
+    ("guaranteed returns", "financial", 18, "Suspicious ROI guarantee"),
+    ("risk-free", "financial", 12, "Unrealistic safety claim: 'risk-free'"),
+    ("no risk", "financial", 12, "Unrealistic safety claim: 'no risk'"),
+    ("0% commission", "quality", 6, "Marketing bait: '0% commission'"),
+    ("exclusive", "manipulation", 5, "Exclusivity framing: 'exclusive'"),
 
-NEGATIVE_SIGNALS = [
-    ("contains_escrow", r"\bescrow\b|\btrust account\b|\bRERA\b|\bDLD\b", -6),
-    ("has_disclaimer", r"\bsubject to\b|\bterms apply\b|\bverify\b|\bdue diligence\b", -4),
-    ("provides_docs", r"\btitle deed\b|\bOqood\b|\bSPA\b|\bMOU\b|\bpassport\b|\btrade license\b", -5),
+    # Financial / terms
+    ("payment plan", "financial", 6, "Mentions payment plan"),
+    ("roi", "financial", 8, "Mentions ROI"),
+    ("rental", "financial", 5, "Mentions rental / rent"),
+    ("service charge", "financial", 8, "Mentions service charges"),
+    ("handover", "financial", 7, "Mentions handover timeline"),
+
+    # Legal / ownership clarity
+    ("title deed", "legal", 12, "Mentions title deed"),
+    ("oqood", "legal", 10, "Mentions Oqood (UAE off-plan)"),
+    ("escrow", "legal", 10, "Mentions escrow"),
+    ("noc", "legal", 6, "Mentions NOC"),
+    ("freehold", "legal", 6, "Mentions freehold"),
+    ("leasehold", "legal", 6, "Mentions leasehold"),
+
+    # Documentation
+    ("passport", "documentation", 7, "Requests passport copy (privacy risk depending on context)"),
+    ("deposit", "documentation", 7, "Mentions deposit"),
+    ("invoice", "documentation", 8, "Mentions invoice"),
+    ("receipt", "documentation", 9, "Mentions receipt / proof"),
+]
+
+CHECKLIST_ITEMS = [
+    ("Price stated clearly", [r"\b(aed|usd|eur|inr)\b", r"\b\d{3,}\b", r"\bprice\b"]),
+    ("Unit details present", [r"\b(bed|bhk|sqm|sq\.? ?ft|bua|plot)\b", r"\bunit\b", r"\bsize\b"]),
+    ("Payment terms mentioned", [r"\b(payment plan|installment|deposit|down payment)\b"]),
+    ("Handover / readiness mentioned", [r"\b(handover|ready|completion)\b"]),
+    ("Legal ownership mention", [r"\b(title deed|oqood|escrow|noc)\b"]),
+    ("Fees/charges mention", [r"\b(service charge|dld|registration|agency fee)\b"]),
+    ("Location/community present", [r"\b(jvc|dubai|abu dhabi|marina|downtown|business bay)\b", r"\blocation\b"]),
+    ("Developer/builder named", [r"\bdeveloper\b", r"\b(damac|emaar|nakheel|sobha|meraas)\b"]),
 ]
 
 def score_text(text: str) -> Dict[str, Any]:
     t = (text or "").lower()
-    length = len(t)
+    words = re.findall(r"\w+", t)
+    wc = len(words)
+    if wc == 0:
+        wc = 1
 
-    # Base dimensional scoring buckets
-    dims = {k: 0.0 for (k, _) in RISK_DIMENSIONS}
-    evidence = {k: [] for (k, _) in RISK_DIMENSIONS}
+    # signal detection
+    signals_out: List[Dict[str, Any]] = []
+    cat_scores = {k: 0 for k, _ in RISK_CATEGORIES}
 
-    def add(dim: str, points: float, note: str):
-        dims[dim] += points
-        evidence[dim].append(note)
+    for phrase, cat, weight, label in SIGNALS:
+        if phrase in t:
+            cat_scores[cat] += weight
+            signals_out.append({
+                "category": cat,
+                "weight": weight,
+                "label": label,
+                "evidence": phrase,
+            })
 
-    # Patterns → dimensions
-    def find_hits(key: str) -> int:
-        cnt = 0
-        for p in PATTERNS[key]:
-            if re.search(p, t):
-                cnt += 1
-        return cnt
+    # ambiguity penalties (enterprise-style)
+    ambiguity = 0
+    if len(text) < 280:
+        ambiguity += 10
+    if re.search(r"\b(call|dm|whatsapp)\b", t) and not re.search(r"\bprice\b|\b(aed|usd|eur|inr)\b", t):
+        ambiguity += 12
+    if re.search(r"\bguaranteed\b", t) and not re.search(r"\bterms\b|\bconditions\b", t):
+        ambiguity += 8
 
-    urg = find_hits("urgency")
-    sca = find_hits("scarcity")
-    gue = find_hits("guarantees")
-    anti = find_hits("anti_due_diligence")
-    docg = find_hits("document_gaps")
-    auth = find_hits("authority_push")
-    pay = find_hits("payment_risk")
+    cat_scores["quality"] += ambiguity
 
-    if urg:
-        add("manipulation", 10 + urg * 6, f"Urgency language detected ({urg} signal(s))")
-    if sca:
-        add("manipulation", 8 + sca * 5, f"Scarcity / exclusivity language detected ({sca} signal(s))")
-    if gue:
-        add("claims", 14 + gue * 7, f"Guarantee-style claims detected ({gue} signal(s))")
-        add("transparency", 6 + gue * 3, "High-precision claims without verifiable proofs often correlate with mis-selling")
-    if anti:
-        add("manipulation", 10 + anti * 6, "Anti-verification or over-reassurance phrasing detected")
-        add("documentation", 8 + anti * 5, "Pressure that discourages due diligence is a strong risk marker")
-    if docg:
-        add("documentation", 12 + docg * 6, "Missing/withheld documentation signals")
-        add("transparency", 8 + docg * 4, "Delayed docs reduce verifiability")
-    if auth:
-        add("identity", 6 + auth * 2, "Authority branding detected (verify via license/registry)")
-    if pay:
-        add("payments", 14 + pay * 6, "High-risk payment instruction pattern detected")
-        add("legal", 6 + pay * 2, "Payment methods can increase compliance and recovery risk")
+    # normalize into 0-100
+    raw_total = sum(cat_scores.values())
+    # dampening so it doesn't blow up
+    risk_score = int(min(100, round(raw_total * 0.9)))
 
-    # Negative signals reduce risk (good signals)
-    for name, pattern, delta in NEGATIVE_SIGNALS:
-        if re.search(pattern, t):
-            # spread reductions across key dims
-            dims["documentation"] += delta
-            dims["transparency"] += delta
-            dims["legal"] += delta / 2
-            evidence["documentation"].append(f"Positive sign: references verifiable controls ({name})")
-            evidence["transparency"].append(f"Positive sign: references verifiable controls ({name})")
-
-    # Normalize by length (short texts should not get extreme confidence)
-    length_factor = clamp(length / 1200.0, 0.35, 1.0)
-
-    # Build total score
-    raw_total = sum(max(0.0, v) for v in dims.values())
-    raw_total *= length_factor
-
-    # Convert to 0..100 with a saturating curve
-    score = 100 * (1 - math.exp(-raw_total / 85.0))
-    score = clamp(score, 0.0, 100.0)
-
-    # Label
-    if score < 20:
+    if risk_score < 25:
         label = "Low"
-    elif score < 45:
-        label = "Guarded"
-    elif score < 70:
-        label = "High"
+    elif risk_score < 55:
+        label = "Medium"
     else:
-        label = "Critical"
+        label = "High"
 
-    # Confidence: based on length + number of matched patterns
-    hit_count = urg + sca + gue + anti + docg + auth + pay
-    conf = 0.35 + 0.35 * length_factor + 0.03 * min(hit_count, 8)
-    conf = clamp(conf, 0.35, 0.90)
+    # signal density per 1000 words
+    signal_density = round((len(signals_out) / wc) * 1000, 2)
 
-    # Make category breakdown (0..100)
-    dim_scores = {}
-    for k, _ in RISK_DIMENSIONS:
-        # scale each dim using soft cap
-        v = max(0.0, dims[k]) * length_factor
-        dim_scores[k] = float(clamp(100 * (1 - math.exp(-v / 28.0)), 0, 100))
+    # checklist
+    checklist = {}
+    completed = 0
+    for name, patterns in CHECKLIST_ITEMS:
+        ok = False
+        for pat in patterns:
+            if re.search(pat, t, flags=re.IGNORECASE):
+                ok = True
+                break
+        checklist[name] = ok
+        if ok:
+            completed += 1
 
-    # Key recommendations (actionable)
-    tips = build_tips(dim_scores, t)
+    checklist_completion = round((completed / max(1, len(CHECKLIST_ITEMS))) * 100, 1)
 
-    # Executive summary
-    summary = build_summary(score, label, dim_scores, hit_count)
+    # confidence heuristic
+    # more text + more evidence improves confidence
+    confidence = 0.55
+    confidence += min(0.25, wc / 2000)
+    confidence += min(0.15, len(signals_out) / 20)
+    confidence -= 0.10 if ambiguity >= 15 else 0.0
+    confidence = float(max(0.35, min(0.92, confidence)))
 
-    # “What to verify” checklist
-    checklist = build_checklist(dim_scores)
+    # recommendations (structured)
+    tips = []
+    if not checklist.get("Price stated clearly"):
+        tips.append("Request an official price breakdown with currency, unit number, and inclusions/exclusions.")
+    if not checklist.get("Fees/charges mention"):
+        tips.append("Ask for service charges, DLD/registration fees, agency fee, and any hidden admin charges in writing.")
+    if any(s["category"] == "manipulation" for s in signals_out):
+        tips.append("Slow the process down. High-pressure language is a red flag — verify documents before paying any deposit.")
+    if any(s["evidence"] == "guaranteed returns" for s in signals_out):
+        tips.append("Treat ROI guarantees as marketing. Ask for audited rental comps and contract terms before believing projections.")
+    if not checklist.get("Legal ownership mention"):
+        tips.append("Request proof of ownership/registration (Title Deed / Oqood / escrow details) before transferring funds.")
+    if "passport" in t and "receipt" not in t:
+        tips.append("Do not share sensitive ID documents without a verified process and clear purpose (privacy risk).")
 
-    # Red flags (top evidence)
-    top_flags = []
-    for k, _ in RISK_DIMENSIONS:
-        for ev in evidence[k][:3]:
-            if "Positive sign" not in ev:
-                top_flags.append({"dimension": k, "note": ev})
-    top_flags = top_flags[:10]
+    if len(tips) < 3:
+        tips.append("Always validate claims via official documents, escrow/payment proof, and independent due diligence.")
 
-    return {
-        "risk_score": round(score, 1),
-        "risk_label": label,
-        "confidence": round(conf, 2),
-        "hit_count": hit_count,
-        "dimensions": dim_scores,
-        "summary": summary,
-        "top_flags": top_flags,
-        "recommendations": tips,
-        "verification_checklist": checklist,
-        "created_at": now_iso(),
+    # build category breakdown percent
+    cat_breakdown = []
+    for k, label_k in RISK_CATEGORIES:
+        val = int(min(100, cat_scores.get(k, 0)))
+        cat_breakdown.append({"key": k, "label": label_k, "value": val})
+
+    # chart structures
+    charts = {
+        "categoryBreakdown": cat_breakdown,
+        "signalDensity": {"value": signal_density, "per": "1000_words"},
+        "checklistCompletion": {"value": checklist_completion},
+        "trendPoint": {"timestamp": now_iso(), "risk_score": risk_score, "confidence": round(confidence, 2)},
     }
 
-def build_summary(score: float, label: str, dim_scores: Dict[str, float], hits: int) -> str:
-    # Focus on top 2 dims
-    top2 = sorted(dim_scores.items(), key=lambda x: x[1], reverse=True)[:2]
-    def pretty(k: str) -> str:
-        for kk, name in RISK_DIMENSIONS:
-            if kk == k:
-                return name
-        return k
-    if hits == 0 and score < 18:
-        return (
-            "The text contains relatively few high-risk manipulation markers. "
-            "This does NOT confirm legitimacy — it only means the language itself isn’t strongly pressuring or deceptive. "
-            "Proceed with standard verification (developer, agent license, escrow/payment proof, contract terms)."
-        )
-    return (
-        f"Overall risk is **{label}** (score {round(score,1)}/100). "
-        f"Highest risk areas: **{pretty(top2[0][0])}** and **{pretty(top2[1][0])}**. "
-        "This score reflects language-based signals (pressure patterns, unverifiable claims, and documentation/payment risk cues) "
-        "and should be validated with official documents and due diligence."
-    )
+    # executive summary
+    executive = {
+        "risk_score": risk_score,
+        "risk_label": label,
+        "confidence": round(confidence, 2),
+        "what_it_means": (
+            "Low risk means fewer manipulation/ambiguity signals, not a guarantee of safety."
+            if label == "Low" else
+            "Medium risk suggests meaningful ambiguity or pressure tactics — verify key terms before proceeding."
+            if label == "Medium" else
+            "High risk indicates strong pressure/guarantee patterns or missing essentials — pause and demand proof."
+        ),
+    }
 
-def build_tips(dim_scores: Dict[str, float], t: str) -> List[Dict[str, Any]]:
-    tips: List[Dict[str, Any]] = []
-
-    def add(priority: str, title: str, details: str):
-        tips.append({"priority": priority, "title": title, "details": details})
-
-    if dim_scores["payments"] >= 45:
-        add(
-            "High",
-            "Confirm payment safety before transferring anything",
-            "Insist on escrow/trust account routes where applicable, written invoices, and beneficiary matching the legal entity. "
-            "Avoid personal accounts, cash-only requests, or vague payment instructions."
-        )
-
-    if dim_scores["documentation"] >= 45 or dim_scores["transparency"] >= 45:
-        add(
-            "High",
-            "Ask for a document pack — not screenshots",
-            "Request: title deed/Oqood, SPA/MOU, payment plan schedule, developer project number, agent RERA/DLD license (UAE), "
-            "and any reservation forms. Cross-check names, dates, and amounts."
-        )
-
-    if dim_scores["claims"] >= 40:
-        add(
-            "Medium",
-            "Treat guaranteed returns as marketing, not proof",
-            "If returns are promised, ask for the basis: rental comps, occupancy assumptions, fees, service charges, and exit liquidity. "
-            "Verify who is guaranteeing and whether it is contractually enforceable."
-        )
-
-    if dim_scores["manipulation"] >= 40:
-        add(
-            "Medium",
-            "Slow down the decision cycle",
-            "Pressure tactics correlate with mis-selling. Use a 24–48 hour cooling-off rule, compare alternatives, "
-            "and keep communication in writing."
-        )
-
-    # always add baseline
-    add(
-        "Baseline",
-        "Verify identity & authority",
-        "Confirm the agent/broker identity via official license registries where available; validate the developer/project via official portals."
-    )
-    add(
-        "Baseline",
-        "Keep evidence",
-        "Save PDFs, emails, WhatsApp messages, receipts, and call summaries. These matter if disputes arise."
-    )
-
-    return tips[:8]
-
-def build_checklist(dim_scores: Dict[str, float]) -> List[Dict[str, Any]]:
-    items: List[Tuple[str, str, str]] = [
-        ("Documents", "Title deed / Oqood / SPA / MOU", "Ask for originals or official PDFs; verify signatures and entity names."),
-        ("Payments", "Beneficiary verification", "Ensure payment goes to the correct legal entity; match invoice and trade license."),
-        ("Project", "Project registration / permit numbers", "Cross-check the project exists and the unit details match."),
-        ("Fees", "Service charges, admin fees, commissions", "Demand full fee breakdown in writing."),
-        ("Timelines", "Handover date + delay clauses", "Check penalty clauses and what constitutes delay."),
-        ("Refunds", "Cancellation and refund conditions", "Look for non-refundable language and exceptions."),
-        ("KYC", "Agent / broker license", "Verify license validity and authorized scope."),
-        ("Proof", "Marketing claims evidence", "Request supporting data: comps, contracts, and audited statements if offered."),
-    ]
-
-    # promote stronger emphasis based on dimensions
-    out = []
-    for cat, title, why in items:
-        weight = 1
-        if cat == "Payments" and dim_scores["payments"] > 40:
-            weight = 3
-        if cat == "Documents" and dim_scores["documentation"] > 40:
-            weight = 3
-        if cat == "Proof" and dim_scores["claims"] > 35:
-            weight = 2
-        out.append({"category": cat, "item": title, "why": why, "priority": weight})
-
-    out.sort(key=lambda x: x["priority"], reverse=True)
-    return out
-
+    return {
+        "executive": executive,
+        "signals": signals_out,
+        "checklist": checklist,
+        "recommendations": tips,
+        "charts": charts,
+        "meta": {
+            "word_count": wc,
+            "raw_total": raw_total,
+            "timestamp": now_iso(),
+            "engine": "rules-v2",
+        },
+    }
 
 # -----------------------------
-# I18N (limited, offline)
+# Language output wrapper (UI controls language; API returns detected too)
 # -----------------------------
-I18N = {
-    "en": {
-        "label": {"Low": "Low", "Guarded": "Guarded", "High": "High", "Critical": "Critical"},
-        "disclaimer": "DeedSense provides language-based risk signals, not legal advice. Always verify with official documents and professional due diligence.",
-    },
-    "ar": {
-        "label": {"Low": "منخفض", "Guarded": "حذر", "High": "مرتفع", "Critical": "حرِج"},
-        "disclaimer": "يوفّر DeedSense إشارات مخاطر مبنية على لغة النص وليس نصيحة قانونية. يجب التحقق من الوثائق الرسمية وإجراء العناية الواجبة.",
-    },
-    "hi": {
-        "label": {"Low": "कम", "Guarded": "सावधानी", "High": "उच्च", "Critical": "गंभीर"},
-        "disclaimer": "DeedSense केवल भाषा-आधारित जोखिम संकेत देता है, यह कानूनी सलाह नहीं है। दस्तावेज़ों और ड्यू डिलिजेंस से सत्यापन ज़रूरी है।",
-    },
-    "fr": {
-        "label": {"Low": "Faible", "Guarded": "Prudent", "High": "Élevé", "Critical": "Critique"},
-        "disclaimer": "DeedSense fournit des signaux de risque basés sur le langage, pas un avis juridique. Vérifiez toujours via des documents officiels et une due diligence.",
-    },
-    "es": {
-        "label": {"Low": "Bajo", "Guarded": "Precaución", "High": "Alto", "Critical": "Crítico"},
-        "disclaimer": "DeedSense ofrece señales de riesgo basadas en el lenguaje, no asesoría legal. Verifica con documentos oficiales y due diligence.",
-    },
-}
-
-def localize_result(result: Dict[str, Any], out_lang: str) -> Dict[str, Any]:
-    lang = out_lang if out_lang in I18N else "en"
-    label_map = I18N[lang]["label"]
-    label = result.get("risk_label", "Low")
-    result["risk_label_local"] = label_map.get(label, label)
-    result["disclaimer_local"] = I18N[lang]["disclaimer"]
-    return result
-
+def resolve_preferred_lang(detected: str, preferred: Optional[str]) -> str:
+    p = (preferred or "").strip().lower()
+    if p:
+        return p
+    return detected or "en"
 
 # -----------------------------
-# API MODELS
-# -----------------------------
-class AnalyzeTextIn(BaseModel):
-    text: str
-    out_lang: Optional[str] = "en"
-
-
-class ChatIn(BaseModel):
-    message: str
-    context_text: Optional[str] = ""
-    out_lang: Optional[str] = "en"
-
-
-# -----------------------------
-# ROUTES
+# Routes
 # -----------------------------
 @app.get("/health")
 def health():
@@ -538,157 +369,144 @@ def health():
         "ok": True,
         "max_upload_mb": MAX_UPLOAD_MB,
         "ocr_lang": OCR_LANG,
-        "pdf_ocr_max_pages": PDF_OCR_MAX_PAGES,
-        "db_enabled": db_enabled(),
+        "pdf_dpi": PDF_DPI,
+        "pdf_ocr_pages_limit": MAX_PDF_PAGES_OCR,
         "time": now_iso(),
     }
 
+@app.get("/info")
+def info():
+    return {
+        "supported_uploads": ["pdf", "docx", "txt", "png", "jpg", "jpeg", "webp"],
+        "notes": [
+            "Scanned PDFs are OCR’d using Tesseract (requires Docker build).",
+            "If a PDF already contains text, OCR is only used when text extraction is insufficient.",
+        ],
+        "time": now_iso(),
+    }
 
-@app.post("/analyze-text")
-def analyze_text(payload: AnalyzeTextIn):
-    text = safe_strip(payload.text)
-    if len(text) < 10:
-        raise HTTPException(status_code=422, detail="Text too short to analyze.")
-    lang_inferred = detect_language_rough(text)
-    result = score_text(text)
-    result["lang_detected"] = lang_inferred
-    result["input_type"] = "text"
-    result = localize_result(result, payload.out_lang or "en")
-
-    # optionally store (public, no user)
-    if db_enabled():
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "insert into scan_history_public (input_type, filename, lang, extracted_text_hash, result_json) values (%s,%s,%s,%s,%s)",
-                    ("text", None, lang_inferred, sha256_text(text), json.dumps(result)),
-                )
-            conn.commit()
-
-    return {"extracted_text": text, "result": result}
-
-
-@app.post("/extract-and-analyze")
-async def extract_and_analyze(
-    out_lang: str = Form("en"),
-    file: UploadFile = File(...),
-):
+@app.post("/extract", response_model=ExtractOut)
+async def extract(file: UploadFile = File(...)):
     filename = file.filename or "upload"
-    content_type = (file.content_type or "").lower()
-    raw = await file.read()
-    enforce_file_size(raw)
+    content_type = file.content_type or ""
+    b = await file.read()
+    enforce_file_size(b)
 
-    name = filename.lower()
+    t = infer_type(filename, content_type)
+    if t == "unknown":
+        raise HTTPException(status_code=415, detail="Unsupported file type. Use PDF, DOCX, TXT, PNG/JPG/JPEG.")
+
     extracted = ""
-    meta: Dict[str, Any] = {"filename": filename, "content_type": content_type}
+    input_type = t
 
     try:
-        if name.endswith(".pdf") or "pdf" in content_type:
-            extracted, m = extract_text_from_pdf(raw)
-            meta.update(m)
-            input_type = "pdf"
-
-        elif name.endswith(".docx") or "officedocument.wordprocessingml.document" in content_type:
-            extracted, m = extract_text_from_docx(raw)
-            meta.update(m)
-            input_type = "docx"
-
-        elif name.endswith(".txt") or "text/plain" in content_type:
-            extracted, m = extract_text_from_txt(raw)
-            meta.update(m)
-            input_type = "txt"
-
-        elif any(name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or "image/" in content_type:
-            extracted, m = extract_text_from_image(raw)
-            meta.update(m)
-            input_type = "image"
-
+        if t == "pdf":
+            extracted, mode = extract_pdf_text(b)
+            input_type = mode
+        elif t == "docx":
+            extracted = extract_docx_text(b)
+        elif t == "txt":
+            extracted = extract_txt_text(b)
+        elif t == "image":
+            extracted = extract_image_text(b)
         else:
-            raise HTTPException(status_code=415, detail="Unsupported file type. Use PDF, DOCX, TXT, PNG, JPG, JPEG.")
-
+            raise HTTPException(status_code=415, detail="Unsupported file type.")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract text: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
-    extracted = safe_strip(extracted)
-    if len(extracted) < 10:
-        raise HTTPException(
-            status_code=422,
-            detail="No readable text found. If this is scanned, ensure OCR is enabled and the scan is clear."
-        )
+    if not extracted or len(extracted) < 15:
+        raise HTTPException(status_code=422, detail="No readable text found. For scanned docs, ensure OCR is enabled and scan is clear.")
 
-    lang_inferred = detect_language_rough(extracted)
-    result = score_text(extracted)
-    result["lang_detected"] = lang_inferred
-    result["input_type"] = input_type
-    result["extract_meta"] = meta
-    result = localize_result(result, out_lang or "en")
+    detected = detect_lang(extracted)
+    return {
+        "filename": filename,
+        "input_type": input_type,
+        "detected_language": detected,
+        "extracted_text": extracted,
+    }
 
-    if db_enabled():
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "insert into scan_history_public (input_type, filename, lang, extracted_text_hash, result_json) values (%s,%s,%s,%s,%s)",
-                    (input_type, filename, lang_inferred, sha256_text(extracted), json.dumps(result)),
-                )
-            conn.commit()
+@app.post("/analyze", response_model=ScanOut)
+def analyze(payload: AnalyzeIn):
+    text = normalize_whitespace(payload.text or "")
+    if len(text) < 20:
+        raise HTTPException(status_code=422, detail="Text too short. Paste more content or upload a file.")
 
-    return {"filename": filename, "extracted_text": extracted, "result": result}
+    detected = detect_lang(text)
+    preferred = resolve_preferred_lang(detected, payload.preferred_language)
 
+    scored = score_text(text)
 
-@app.get("/history")
-def history(limit: int = 50):
-    if not db_enabled():
-        return {"items": [], "note": "DATABASE_URL not set. UI will use local browser history for now."}
+    return {
+        "filename": None,
+        "input_type": "text",
+        "detected_language": detected,
+        "preferred_language": preferred,
+        "extracted_text": text,
+        "analysis": scored["executive"],
+        "charts": scored["charts"],
+        "checklist": scored["checklist"],
+        "signals": scored["signals"],
+        "meta": {
+            **scored["meta"],
+            "preferred_language": preferred,
+            "disclaimer": "Not legal advice. Validate via official documents and due diligence.",
+        },
+    }
 
-    limit = max(1, min(200, int(limit)))
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "select id, created_at, input_type, filename, lang, result_json from scan_history_public order by created_at desc limit %s",
-                (limit,),
-            )
-            return {"items": cur.fetchall()}
+@app.post("/scan", response_model=ScanOut)
+async def scan(file: UploadFile = File(...), preferred_language: Optional[str] = None):
+    filename = file.filename or "upload"
+    content_type = file.content_type or ""
+    b = await file.read()
+    enforce_file_size(b)
 
+    t = infer_type(filename, content_type)
+    if t == "unknown":
+        raise HTTPException(status_code=415, detail="Unsupported file type. Use PDF, DOCX, TXT, PNG/JPG/JPEG.")
 
-@app.post("/chat")
-def chat(payload: ChatIn):
-    """
-    MVP chat:
-    - Uses offline guidance and your scan context.
-    - Web-research mode can be added later (server-side search integrations).
-    """
-    msg = safe_strip(payload.message)
-    if not msg:
-        raise HTTPException(status_code=422, detail="Message required.")
+    extracted = ""
+    input_type = t
 
-    ctx = safe_strip(payload.context_text or "")
-    lang = payload.out_lang if payload.out_lang in I18N else "en"
+    try:
+        if t == "pdf":
+            extracted, mode = extract_pdf_text(b)
+            input_type = mode
+        elif t == "docx":
+            extracted = extract_docx_text(b)
+        elif t == "txt":
+            extracted = extract_txt_text(b)
+        elif t == "image":
+            extracted = extract_image_text(b)
+        else:
+            raise HTTPException(status_code=415, detail="Unsupported file type.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
-    # Simple intent hints
-    want_properties = bool(re.search(r"\b(find|search|options|properties|projects|area|budget|villa|apartment)\b", msg.lower()))
-    want_risk_help = bool(re.search(r"\b(risk|scam|safe|legit|verify|fraud|trust)\b", msg.lower()))
+    if not extracted or len(extracted) < 15:
+        raise HTTPException(status_code=422, detail="No readable text found. For scanned docs, ensure OCR is enabled and scan is clear.")
 
-    base = []
-    base.append("Here’s a practical investor-grade approach based on your message.")
+    detected = detect_lang(extracted)
+    preferred = resolve_preferred_lang(detected, preferred_language)
 
-    if ctx and want_risk_help:
-        # quick add-on: recommend verification steps
-        base.append("If you paste the full listing/broker message and payment terms, I can pinpoint pressure language and missing-doc signals.")
-        base.append("Immediate due diligence checklist: verify agent license, project registration, beneficiary verification, escrow/trust account, and contract clauses.")
+    scored = score_text(extracted)
 
-    if want_properties:
-        # no web search right now (by design)
-        base.append("Property search mode is currently offline in this MVP build (no web queries yet).")
-        base.append("If you share: city/area, budget, purpose (end-use vs investment), timeline, and risk tolerance — I’ll propose a shortlist framework and what to compare.")
-        base.append("Later we can enable Web Research mode to return verified listings with links.")
-
-    base.append("If you want, paste your document text and ask: “What are the top 5 red flags and what should I ask the agent?”")
-
-    answer = "\n\n".join(base)
-
-    # lightweight localization for disclaimers only
-    disclaimer = I18N[lang]["disclaimer"]
-
-    return {"reply": answer, "disclaimer": disclaimer, "mode": "offline-mvp"}
+    return {
+        "filename": filename,
+        "input_type": input_type,
+        "detected_language": detected,
+        "preferred_language": preferred,
+        "extracted_text": extracted,
+        "analysis": scored["executive"],
+        "charts": scored["charts"],
+        "checklist": scored["checklist"],
+        "signals": scored["signals"],
+        "meta": {
+            **scored["meta"],
+            "preferred_language": preferred,
+            "disclaimer": "Not legal advice. Validate via official documents and due diligence.",
+        },
+    }
